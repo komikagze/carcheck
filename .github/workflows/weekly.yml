@@ -1,0 +1,146 @@
+# .github/workflows/weekly.yml
+#
+# Снимает зависимость от постоянно включённого домашнего компьютера: раз в неделю
+# GitHub-хостед раннер сам:
+#   1. Скачивает накопленную БД с прошлой недели из GitHub Release (тег db-latest,
+#      см. ниже "Хранение БД: GitHub Release, а не git" — почему не коммит).
+#   2. Тянет данные Минтранса постранично через JSON API (package_show -> collector.py).
+#   3. Дифает их с накопленной SQLite-базой.
+#   4. Собирает статический сайт (интерфейс + Cloudflare Pages Function) в export/dist/.
+#   5. Заливает обновлённую БД обратно в GitHub Release (тег db-latest).
+#   6. Публикует export/dist/ в ветку gh-pages (её подхватывает Cloudflare Pages).
+#   7. Заливает накопленную историю по машинам в Cloudflare KV — ТОЛЬКО туда,
+#      не в статические файлы сайта (см. ниже, почему).
+#
+# ХРАНЕНИЕ БД: GITHUB RELEASE, А НЕ GIT (обнаружено на первом реальном прогоне):
+#
+#   БД на реальном объёме данных (2.4М+ строк current_state, 5.2М+ строк ownership)
+#   весит 600+ МБ и продолжит расти. GitHub жёстко блокирует git push файлов
+#   больше 100 МБ (без Git LFS), а обычный git-коммит такого файла КАЖДУЮ неделю
+#   ещё и раздувал бы историю репозитория на сотни МБ еженедельно навсегда.
+#   Поэтому БД хранится отдельно от git — как ассет GitHub Release с фиксированным
+#   тегом db-latest (лимит GitHub на размер ассета релиза — 2 ГБ, без квоты трафика,
+#   в отличие от Git LFS). Каждый прогон перезаписывает этот же ассет (--clobber).
+#   Локальная копия (collector/db/carcheck.sqlite3 на своём компьютере) в git
+#   тоже не попадает (см. .gitignore) — она просто живёт на диске сама по себе,
+#   независимо от того, что происходит в Actions, и служит запасной копией.
+#
+# Компьютер пользователя нужен только один раз — чтобы запушить репозиторий на
+# GitHub и настроить Cloudflare (KV namespace + привязка к Pages). Дальше всё
+# крутится само по расписанию.
+#
+# АРХИТЕКТУРА ДОСТАВКИ ДАННЫХ (см. README, раздел "Деплой: Cloudflare Pages +
+# Pages Functions + KV"):
+#
+#   - Репозиторий, код и сам сайт — полностью публичные, без всякого логина.
+#     Живой поиск по data.gov.il доступен всем как есть — это открытые госданные.
+#   - НАКОПЛЕННАЯ сборщиком история (показания одометра по датам, смена номера
+#     двигателя, аномалии пробега) — тоже должна быть доступна любому посетителю
+#     ПРИ ПОИСКЕ КОНКРЕТНОГО НОМЕРА (это главная ценность инструмента), но не
+#     должна быть доступна для массовой выгрузки всей базы разом.
+#   - Раньше это пытались решить публичными JSON-шардами (dist/data/XXX.json)
+#     под Cloudflare Access — но и шарды сами по себе перебираемы скриптом
+#     (300-999 файлов), и Access либо закрывает всё (не подходит), либо ничего
+#     не даёт при точечном публичном доступе. Оба варианта отклонены.
+#   - Сейчас: история отдаётся ТОЛЬКО поштучно через Cloudflare Pages Function
+#     (export/dist_template/functions/api/history/[plate].js), которая читает
+#     Cloudflare KV по ключу car:<номер>. Способа перечислить/выгрузить все
+#     ключи через сайт не существует. Сама функция вдобавок ограничивает число
+#     запросов с одного IP в минуту (свой рейт-лимит поверх той же KV) — это
+#     не железная защита, а именно то, что описано в README: делает перебор
+#     всего диапазона номеров практически нецелесообразным, не более того.
+#   - Наполняет KV шаг "Upload accumulated history to Cloudflare KV" ниже —
+#     через export/kv_upload.py и REST API Cloudflare, без wrangler/npm.
+
+name: Weekly carcheck collector + export
+
+on:
+  schedule:
+    # Каждый понедельник в 03:00 UTC (~06:00 по Израилю летом, ~05:00 зимой).
+    # Поменять время — поменять cron ниже.
+    - cron: "0 3 * * 1"
+  workflow_dispatch: {}   # ручной запуск из вкладки Actions -> Run workflow
+
+permissions:
+  contents: write   # нужно, чтобы workflow мог публиковать/обновлять GitHub Release и пушить gh-pages
+
+concurrency:
+  group: carcheck-weekly
+  cancel-in-progress: false   # не обрывать сборщик на середине скачивания
+
+jobs:
+  collect-and-export:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60   # постраничная загрузка ~2.4 + ~5.3 млн строк через JSON API + диф — с запасом
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Download previous database from GitHub Release (db-latest), если уже есть
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir -p collector/db
+          gh release download db-latest --repo "${{ github.repository }}" \
+            --pattern carcheck.sqlite3 --dir collector/db --clobber \
+            || echo "Релиза db-latest ещё нет — это первый прогон, БД создастся с нуля."
+
+      - name: Run collector (package_show -> постраничная загрузка через JSON API -> диф -> SQLite)
+        run: python collector/collector.py
+
+      - name: Run export (собрать статический сайт в export/dist, без данных по машинам)
+        run: python export/export.py
+
+      - name: Upload updated database to GitHub Release (db-latest)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if gh release view db-latest --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            gh release upload db-latest collector/db/carcheck.sqlite3 \
+              --repo "${{ github.repository }}" --clobber
+          else
+            gh release create db-latest collector/db/carcheck.sqlite3 \
+              --repo "${{ github.repository }}" \
+              --title "carcheck: накопленная база (авто-обновление)" \
+              --notes "Служебный ассет — перезаписывается еженедельно workflow'ом weekly.yml. Не предназначен для просмотра людьми; текущее состояние сайта смотрите на самом сайте."
+          fi
+
+      - name: Publish export/dist to gh-pages (статика + Pages Function, БЕЗ данных по машинам)
+        uses: peaceiris/actions-gh-pages@v4
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: ./export/dist
+          publish_branch: gh-pages
+          keep_files: false
+          commit_message: "weekly export"
+
+      - name: Upload accumulated history to Cloudflare KV
+        env:
+          CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
+          CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
+          CF_KV_NAMESPACE_ID: ${{ secrets.CF_KV_NAMESPACE_ID }}
+        run: python export/kv_upload.py
+        # Если секреты ещё не заведены — скрипт сам это обнаружит, аккуратно
+        # пропустит загрузку и объяснит, что нужно настроить (см. README), а не
+        # уронит весь workflow с невнятной ошибкой.
+
+      - name: Upload run log as artifact (для отладки, если сборщик упал)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: collector-log
+          path: collector/logs/collector.log
+          if-no-files-found: ignore
+          retention-days: 14
