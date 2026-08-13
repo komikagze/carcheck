@@ -1,0 +1,33 @@
+<!DOCTYPE html>
+<html lang="he" dir="rtl">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0">
+<title>בדיקת רכב לפי מספר רישוי (גרסה סטטית)</title>
+<link rel="stylesheet" href="static/style.css">
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>🚗 בדיקת רכב לפי מספר רישוי</h1>
+    <p>גרסה סטטית — נתוני data.gov.il ישירות מהדפדפן + היסטוריה של רכב בודד דרך /api/history/&lt;מספר&gt;</p>
+  </header>
+
+  <div class="search-box">
+    <input id="plateInput" type="tel" inputmode="numeric" placeholder="מספר רכב, למשל 1234567" maxlength="10">
+    <button id="searchBtn">חפש</button>
+  </div>
+  <div class="hint">הוסיפו את הדף הזה למסך הבית בטלפון — יעבוד כמו אפליקציה 📲</div>
+
+  <div id="result"></div>
+
+  <footer>
+    מקור הנתונים: <a href="https://data.gov.il/dataset/private-and-commercial-vehicles" target="_blank">data.gov.il — משרד התחבורה</a><br>
+    מוצגים רק נתונים ממשלתיים פתוחים ורשמיים. שם הבעלים אינו מתפרסם באופן פומבי.<br>
+    <span id="metaLine"></span>
+  </footer>
+</div>
+
+<script src="static/app.js"></script>
+</body>
+</html>
