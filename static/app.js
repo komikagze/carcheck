@@ -3,7 +3,7 @@
 // из data.gov.il в браузере (CORS там открыт — проверено в исходном прототипе
 // carcheck.html), а накопленная история пробега/двигателя — поштучно, по одному
 // номеру за раз, через Cloudflare Pages Function /api/history/<номер>, которая
-// читает Cloudflare KV (см. functions/api/history/[plate].js и export/kv_upload.py).
+// читает Turso (см. functions/api/history/[plate].js и export/turso_upload.py).
 // Никакого файла со всеми машинами сразу не существует — так исключается
 // массовый скрейпинг накопленной базы (см. README, раздел "Деплой: Cloudflare
 // Pages + Pages Functions + KV").
@@ -350,25 +350,10 @@ function renderExternalLinks(plate) {
   </div>`;
 }
 
-// ---- накопленная история через /api/history/<номер> (Cloudflare Pages Function + KV) ----
-
-function sparkline(points) {
-  if (points.length < 2) return "";
-  const w = 520, h = 110, pad = 8;
-  const ys = points.map(p => p.km);
-  const minY = Math.min(...ys), maxY = Math.max(...ys);
-  const spanY = (maxY - minY) || 1;
-  const stepX = (w - pad * 2) / Math.max(1, points.length - 1);
-  const coords = points.map((p, i) => {
-    const x = pad + i * stepX;
-    const y = h - pad - ((p.km - minY) / spanY) * (h - pad * 2);
-    return `${x.toFixed(1)},${y.toFixed(1)}`;
-  });
-  return `<svg class="odo-chart" viewBox="0 0 ${w} ${h}" preserveAspectRatio="none">
-    <polyline points="${coords.join(" ")}" fill="none" stroke="#4fb0ff" stroke-width="2.5"/>
-    ${coords.map(c => `<circle cx="${c.split(",")[0]}" cy="${c.split(",")[1]}" r="3" fill="#33d69f"/>`).join("")}
-  </svg>`;
-}
+// ---- накопленная история через /api/history/<номер> (Cloudflare Pages Function + Turso) ----
+// График-спарклайн убран вместе с переходом на плоскую таблицу
+// "последний тест / предыдущий тест": рисовать линию по двум точкам незачем,
+// разница между ними показана числом прямо в таблице.
 
 async function fetchHistory(plate) {
   // Накопленная история отдаётся ТОЛЬКО поштучно, через Cloudflare Pages Function
@@ -384,6 +369,80 @@ async function fetchHistory(plate) {
   } catch (e) {
     return { fetchError: true };
   }
+}
+
+const CHANGE_KIND_LABELS = {
+  new_car: "הרכב נוסף למאגר",
+  changed: "שינוי בנתונים",
+  anomaly: "ירידה בקילומטראז' (חשד לסיבוב מד)",
+};
+
+const kmText = (v) => (v == null ? "—" : Number(v).toLocaleString("he-IL") + ' ק"מ');
+
+// Полная история всех тестов + разница между соседними.
+// Приходит уже отсортированной от новых к старым (см. Pages Function),
+// поэтому первая строка — последний тест.
+function renderOdometerTable(odometer) {
+  if (!odometer || !odometer.length) {
+    return `<div class="card"><div class="empty">טרם נאספו קריאות של מד הקילומטראז'.</div></div>`;
+  }
+  const rows = odometer.map((p, i) => {
+    const next = odometer[i + 1];   // предыдущий по времени тест
+    let delta = "—";
+    if (next && p.km != null && next.km != null) {
+      const d = Number(p.km) - Number(next.km);
+      delta = d < 0
+        ? `<span style="color:var(--danger);font-weight:700;">${kmText(Math.abs(d))} ירידה!</span>`
+        : `+${Number(d).toLocaleString("he-IL")}`;
+    }
+    return `<tr>
+      <td>${esc(p.test_date || "—")}</td>
+      <td>${kmText(p.km)}</td>
+      <td>${delta}</td>
+    </tr>`;
+  }).join("");
+  return `<div class="card">
+    <div style="font-size:13px;color:var(--muted);margin-bottom:8px;">
+      כל מבחני הרישוי שנצברו (${odometer.length})</div>
+    <div style="overflow-x:auto;">
+      <table class="odo-table"><thead><tr>
+        <th>תאריך המבחן</th><th>קילומטראז'</th><th>שינוי מהמבחן הקודם</th>
+      </tr></thead><tbody>${rows}</tbody></table>
+    </div>
+    <div class="src">התאריכים הם תאריכי מבחן הרישוי בפועל (לפי משרד התחבורה), לא מועד האיסוף שלנו.
+    השורה העליונה היא המבחן האחרון. "ירידה" בעמודה הימנית = הקילומטראז' קטן בין מבחנים,
+    מה שאינו קורה בשימוש רגיל.</div>
+  </div>`;
+}
+
+// Подробный журнал "когда, что, было -> стало" — то, ради чего вообще
+// копится собственная база: государство таких изменений не публикует.
+function renderChangeLog(changes) {
+  if (!changes || !changes.length) return "";
+  const rows = changes.map(c => {
+    const kind = CHANGE_KIND_LABELS[c.change_kind] || c.change_kind;
+    const what = c.field_label || (c.change_kind === "new_car" ? "—" : (c.field || "—"));
+    const from = c.old_value == null || c.old_value === "" ? "—" : c.old_value;
+    const to = c.new_value == null || c.new_value === "" ? "—" : c.new_value;
+    const cls = c.change_kind === "anomaly" ? ' style="color:var(--danger);font-weight:700;"' : "";
+    return `<tr>
+      <td>${esc(fmtDate(c.detected_at) || (c.detected_at || "").slice(0, 10))}</td>
+      <td${cls}>${esc(kind)}</td>
+      <td>${esc(what)}</td>
+      <td>${esc(from)}</td>
+      <td>${esc(to)}</td>
+    </tr>`;
+  }).join("");
+  return `<div class="card">
+    <div style="font-size:13px;color:var(--muted);margin-bottom:4px;">יומן שינויים מפורט</div>
+    <div style="overflow-x:auto;">
+      <table class="odo-table"><thead><tr>
+        <th>מתי</th><th>סוג</th><th>שדה</th><th>לפני</th><th>אחרי</th>
+      </tr></thead><tbody>${rows}</tbody></table>
+    </div>
+    <div class="src">כל שינוי שזוהה בין שני צילומי מצב שבועיים של משרד התחבורה, שדה אחר שדה.
+    "מתי" הוא מועד הזיהוי על ידי המאסף.</div>
+  </div>`;
 }
 
 function renderLocalHistory(local) {
@@ -420,17 +479,9 @@ function renderLocalHistory(local) {
       </div>`).join("")}
     </div>`;
   }
-  if (local.odometer && local.odometer.length) {
-    const rows = local.odometer.map(p => `<tr><td>${esc((p.date || "").slice(0, 10))}</td><td>${p.km != null ? Number(p.km).toLocaleString("he-IL") + ' ק"מ' : "—"}</td></tr>`).join("");
-    html += `<div class="card">
-      <div style="font-size:13px;color:var(--muted);margin-bottom:4px;">היסטוריית קריאות מד הקילומטראז'</div>
-      ${sparkline(local.odometer.filter(p => p.km != null))}
-      <table class="odo-table"><thead><tr><th>תאריך צילום</th><th>קילומטראז'</th></tr></thead><tbody>${rows}</tbody></table>
-      <div class="src">נצבר אחת לשבוע (GitHub Actions או מאסף מקומי), לא מתפרסם על ידי משרד התחבורה בשום צורה אחרת.</div>
-    </div>`;
-  } else {
-    html += `<div class="card"><div class="empty">טרם נאספו קריאות של מד הקילומטראז'.</div></div>`;
-  }
+  html += renderOdometerTable(local.odometer);
+
+  html += renderChangeLog(local.changes);
   return html;
 }
 
