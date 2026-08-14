@@ -1,12 +1,11 @@
-// export/dist_template/static/app.js
+// export/dist_template/public/static/app.js
 // Статическая версия интерфейса (без сервера): живые данные тянутся прямо
 // из data.gov.il в браузере (CORS там открыт — проверено в исходном прототипе
 // carcheck.html), а накопленная история пробега/двигателя — поштучно, по одному
-// номеру за раз, через Cloudflare Pages Function /api/history/<номер>, которая
-// читает Turso (см. functions/api/history/[plate].js и export/turso_upload.py).
+// номеру за раз, через серверную функцию /api/history/<номер>, которая читает
+// Turso (см. worker/index.js и export/turso_upload.py).
 // Никакого файла со всеми машинами сразу не существует — так исключается
-// массовый скрейпинг накопленной базы (см. README, раздел "Деплой: Cloudflare
-// Pages + Pages Functions + KV").
+// массовый скрейпинг накопленной базы (см. README и HANDOFF).
 //
 // Логика живых блоков — прямой перенос уже проверенного прототипа carcheck.html
 // (тот же набор resource_id, тот же перевод полей). Дополнительно добавлен блок
@@ -508,16 +507,15 @@ function renderExternalLinks(plate) {
   </div>`;
 }
 
-// ---- накопленная история через /api/history/<номер> (Cloudflare Pages Function + Turso) ----
+// ---- накопленная история через /api/history/<номер> (Cloudflare Worker + Turso) ----
 // График-спарклайн убран вместе с переходом на плоскую таблицу
 // "последний тест / предыдущий тест": рисовать линию по двум точкам незачем,
 // разница между ними показана числом прямо в таблице.
 
 async function fetchHistory(plate) {
-  // Накопленная история отдаётся ТОЛЬКО поштучно, через Cloudflare Pages Function
-  // /api/history/<номер> -> Cloudflare KV. Никакого файла со всеми машинами сразу
-  // не существует — так исключается массовый скрейпинг базы (см. README, раздел
-  // "Деплой: Cloudflare Pages + Pages Functions + KV").
+  // Накопленная история отдаётся ТОЛЬКО поштучно, через Cloudflare Worker
+  // /api/history/<номер> -> Turso. Никакого файла со всеми машинами сразу
+  // не существует — так исключается массовый скрейпинг базы (см. README и HANDOFF).
   try {
     const res = await fetch(`/api/history/${plate}`, { cache: "no-store" });
     if (res.status === 429) return { rateLimited: true };   // штатная ситуация — не ошибка
