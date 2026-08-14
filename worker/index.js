@@ -117,6 +117,24 @@ function rowsOf(result) {
   });
 }
 
+// Рейт-лимит — это ЗАПИСЬ в базу, и запись может быть недоступна по причинам,
+// не имеющим отношения к запрошенной машине: read-only токен, исчерпанная
+// месячная квота, временный сбой. Раньше такой сбой ронял ВЕСЬ запрос с 502 —
+// то есть невозможность посчитать обращения лишала пользователя данных, хотя
+// сами данные читаются прекрасно.
+//
+// Хуже того, конструкция была вывернутой: защита от скрапинга сама расходовала
+// квоту. Перебор номеров упирался в лимит, но каждая отбитая попытка всё равно
+// списывала записи, а исчерпание квоты блокирует аккаунт целиком — то есть
+// перебор клал сайт, даже будучи успешно отражённым.
+//
+// Теперь ограничение необязательное: если запись не прошла, запрос повторяется
+// в режиме "только чтение" и история всё равно отдаётся. Деградация мягкая.
+// Плата за это — в такие моменты частота обращений не ограничивается; выбор
+// сознательный, доступность данных важнее идеального счётчика.
+//
+// RATE_LIMIT_DISABLED=1 в переменных воркера выключает запись заранее, не
+// тратя попытку. Нужно, когда квота на нуле и трогать запись нельзя вовсе.
 async function handleHistory(request, env, rawPlate) {
   if (!env.TURSO_DATABASE_URL || !env.TURSO_AUTH_TOKEN) {
     return jsonResponse(
@@ -135,36 +153,66 @@ async function handleHistory(request, env, rawPlate) {
   const ip = request.headers.get("CF-Connecting-IP") || "unknown";
   const minute = Math.floor(Date.now() / 60000);
 
-  try {
-    // Рейт-лимит и выборка данных — одним HTTP-вызовом, чтобы не платить
-    // за вторую поездку до базы на каждый запрос.
-    const results = await turso(env, [
-      // Инкремент корзины и сразу получение счётчика (RETURNING поддерживается).
-      [
-        "INSERT INTO rate_limit (bucket, minute, hits) VALUES (?, ?, 1) " +
-          "ON CONFLICT(bucket) DO UPDATE SET hits = hits + 1 RETURNING hits",
-        [`${ip}:${minute}`, minute],
-      ],
-      // Подчищаем корзины старше двух минут, чтобы таблица не росла бесконечно.
-      ["DELETE FROM rate_limit WHERE minute < ?", [minute - 2]],
-      // Все показания одометра по этой машине, от новых к старым:
-      // первые две строки — это и есть "последний" и "предыдущий" тест.
-      ["SELECT test_date, km FROM odometer WHERE plate = ? ORDER BY test_date DESC", [plate]],
-      // Полный журнал изменений по этой машине.
-      [
-        "SELECT detected_at, change_kind, field, field_label, old_value, new_value " +
-          "FROM changes WHERE plate = ? ORDER BY detected_at ASC, local_id ASC",
-        [plate],
-      ],
-    ]);
+  // Только чтение — то, ради чего пришёл пользователь. Работает всегда.
+  const dataStatements = [
+    // Все показания одометра по этой машине, от новых к старым:
+    // первые две строки — это и есть "последний" и "предыдущий" тест.
+    ["SELECT test_date, km FROM odometer WHERE plate = ? ORDER BY test_date DESC", [plate]],
+    // Полный журнал изменений по этой машине.
+    [
+      "SELECT detected_at, change_kind, field, field_label, old_value, new_value " +
+        "FROM changes WHERE plate = ? ORDER BY detected_at ASC, local_id ASC",
+      [plate],
+    ],
+  ];
 
-    const hits = rowsOf(results[0])[0]?.hits ?? 0;
-    if (hits > RATE_LIMIT_PER_MINUTE) {
-      return jsonResponse({ error: "יותר מדי בקשות מכתובת זו. נסו שוב בעוד דקה." }, 429);
+  // Запись счётчика обращений. Может не пройти — см. комментарий выше.
+  const limiterStatements = [
+    // Инкремент корзины и сразу получение счётчика (RETURNING поддерживается).
+    [
+      "INSERT INTO rate_limit (bucket, minute, hits) VALUES (?, ?, 1) " +
+        "ON CONFLICT(bucket) DO UPDATE SET hits = hits + 1 RETURNING hits",
+      [`${ip}:${minute}`, minute],
+    ],
+    // Подчищаем корзины старше двух минут, чтобы таблица не росла бесконечно.
+    ["DELETE FROM rate_limit WHERE minute < ?", [minute - 2]],
+  ];
+
+  const limiterOff = String(env.RATE_LIMIT_DISABLED || "") === "1";
+
+  try {
+    let results = null;
+    let limiterWorked = false;
+
+    if (!limiterOff) {
+      try {
+        // Обычный путь: счётчик и данные одним HTTP-вызовом, чтобы не платить
+        // за вторую поездку до базы на каждом запросе.
+        results = await turso(env, [...limiterStatements, ...dataStatements]);
+        limiterWorked = true;
+      } catch (e) {
+        // Запись не прошла. Не выясняем, почему именно (нет прав, кончилась
+        // квота, сбой) — любая причина значит одно и то же: считать обращения
+        // сейчас нельзя, но отдать историю можно. Вторая поездка только здесь.
+        results = null;
+      }
     }
 
-    const odometer = rowsOf(results[2]);
-    const changes = rowsOf(results[3]);
+    if (!results) {
+      results = await turso(env, dataStatements);
+    }
+
+    if (limiterWorked) {
+      const hits = rowsOf(results[0])[0]?.hits ?? 0;
+      if (hits > RATE_LIMIT_PER_MINUTE) {
+        return jsonResponse({ error: "יותר מדי בקשות מכתובת זו. נסו שוב בעוד דקה." }, 429);
+      }
+    }
+
+    // Данные лежат после запросов счётчика, если те выполнялись.
+    const offset = limiterWorked ? limiterStatements.length : 0;
+    const odometer = rowsOf(results[offset]);
+    const changes = rowsOf(results[offset + 1]);
 
     if (odometer.length === 0 && changes.length === 0) {
       return jsonResponse(
