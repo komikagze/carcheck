@@ -138,6 +138,11 @@ CREATE TABLE IF NOT EXISTS odometer_readings (
     first_seen_at TEXT NOT NULL,   -- когда наш сборщик впервые увидел эту запись
     PRIMARY KEY (plate, test_date)
 );
+-- Под курсор возобновляемой заливки в Turso (export/turso_upload.py):
+-- она идёт пачками в порядке (first_seen_at, plate, test_date), и без этого
+-- индекса каждая пачка пересортировывала бы всю таблицу заново.
+CREATE INDEX IF NOT EXISTS idx_odometer_readings_cursor
+    ON odometer_readings(first_seen_at, plate, test_date);
 
 -- Подробный журнал изменений: одна строка на КАЖДОЕ изменившееся поле,
 -- с человекочитаемым названием поля и значениями "было -> стало".

@@ -40,6 +40,7 @@ import json
 import os
 import sqlite3
 import sys
+import time
 import urllib.error
 import urllib.request
 
@@ -131,10 +132,18 @@ def _arg(value):
     return {"type": "text", "value": str(value)}
 
 
-def pipeline(api_url: str, token: str, statements: list, timeout: int = 120) -> list:
+def pipeline(api_url: str, token: str, statements: list, timeout: int = 120,
+             attempts: int = 5) -> list:
     """Отправляет пачку SQL-запросов одним HTTP-вызовом.
     statements — список либо строк, либо кортежей (sql, [args...]).
-    Возвращает список результатов (по одному на запрос)."""
+    Возвращает список результатов (по одному на запрос).
+
+    Полная заливка — это сотни последовательных запросов подряд; без ретраев
+    одна случайная сетевая икота или 5xx роняет весь прогон (ровно это и
+    случилось на первом реальном прогоне через GitHub Actions). Поэтому на
+    временные ошибки — несколько попыток с нарастающей паузой. Ошибки самого
+    SQL (неверный запрос, нет таблицы) не ретраятся: они не пройдут и на
+    десятый раз, лучше упасть сразу и честно."""
     requests_payload = []
     for st in statements:
         if isinstance(st, str):
@@ -146,12 +155,30 @@ def pipeline(api_url: str, token: str, statements: list, timeout: int = 120) -> 
     requests_payload.append({"type": "close"})
 
     body = json.dumps({"requests": requests_payload}).encode("utf-8")
-    req = urllib.request.Request(api_url, data=body, method="POST", headers={
-        "Authorization": f"Bearer {token}",
-        "Content-Type": "application/json",
-    })
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        data = json.loads(resp.read().decode("utf-8"))
+
+    last_err = None
+    for i in range(attempts):
+        try:
+            req = urllib.request.Request(api_url, data=body, method="POST", headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json",
+            })
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+            break
+        except urllib.error.HTTPError as e:
+            # 4xx (кроме 429) — наша вина, повтор не поможет.
+            if e.code != 429 and 400 <= e.code < 500:
+                raise
+            last_err = e
+        except (urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError) as e:
+            last_err = e
+        if i < attempts - 1:
+            wait = 2 ** i
+            print(f"[turso_upload] Временная ошибка ({last_err}), повтор через {wait} с...")
+            time.sleep(wait)
+    else:
+        raise RuntimeError(f"Turso не ответил после {attempts} попыток: {last_err}")
 
     results = data.get("results", [])
     for r in results:
@@ -182,34 +209,70 @@ def set_sync_state(api_url: str, token: str, updates: dict):
         pipeline(api_url, token, statements)
 
 
-def collect_rows(conn, state: dict):
-    """Собирает из локальной базы всё, что появилось после прошлой заливки.
-    Возвращает dict: имя таблицы -> (колонки, список кортежей значений)."""
-    # Все показания одометра. Отсекаем по времени, когда сборщик впервые их
-    # увидел: каждую неделю уезжают только новые тесты, а не вся история заново.
-    since_reading = state.get("last_reading_seen") or ""
-    odometer = [
-        (r[0], r[1], r[2]) for r in conn.execute(
-            "SELECT plate, test_date, km FROM odometer_readings "
-            "WHERE first_seen_at > ?", (since_reading,)
-        )
-    ]
+# Сколько строк уезжает за один HTTP-запрос.
+BATCH_ROWS = ROWS_PER_STATEMENT * STATEMENTS_PER_REQUEST
 
-    # Журнал изменений: отсекаем по id — надёжнее времени, т.к. id строго растёт
-    # и не зависит от того, совпали ли метки времени внутри одного прогона.
-    since_change_id = int(state.get("last_change_id") or 0)
-    changes = [
-        (r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7]) for r in conn.execute(
-            "SELECT id, plate, detected_at, change_kind, field, field_label, old_value, new_value "
-            "FROM field_changes WHERE id > ?", (since_change_id,)
-        )
-    ]
 
-    return {
-        "odometer": (["plate", "test_date", "km"], odometer),
-        "changes": (["local_id", "plate", "detected_at", "change_kind",
-                     "field", "field_label", "old_value", "new_value"], changes),
-    }
+def _upload_chunk(api_url, token, table, columns, rows):
+    """Заливает пачку строк одним запросом (несколько многострочных INSERT-ов)."""
+    pipeline(api_url, token, build_insert_statements(table, columns, rows))
+
+
+def sync_odometer(conn, api_url, token, state):
+    """Заливает показания одометра, продвигая курсор ПОСЛЕ КАЖДОЙ пачки.
+
+    Курсор — тройка (first_seen_at, plate, test_date). Она строго возрастает
+    между прогонами: строки, добавленные позже, имеют более позднее
+    first_seen_at. Поэтому одного курсора хватает и для докачки после сбоя,
+    и для инкремента на следующей неделе."""
+    raw = state.get("odometer_cursor") or "||"
+    parts = raw.split("|")
+    c1, c2, c3 = (parts + ["", "", ""])[:3]
+    total = 0
+    while True:
+        rows = conn.execute(
+            """
+            SELECT first_seen_at, plate, test_date, km FROM odometer_readings
+            WHERE (first_seen_at, plate, test_date) > (?, ?, ?)
+            ORDER BY first_seen_at, plate, test_date
+            LIMIT ?
+            """, (c1, c2, c3, BATCH_ROWS)
+        ).fetchall()
+        if not rows:
+            break
+        _upload_chunk(api_url, token, "odometer", ["plate", "test_date", "km"],
+                      [(r[1], r[2], r[3]) for r in rows])
+        c1, c2, c3 = rows[-1][0], rows[-1][1], rows[-1][2]
+        # Курсор двигаем ОТДЕЛЬНЫМ запросом и только после того, как пачка
+        # реально уехала: если упадём между ними, максимум перезальём
+        # последнюю пачку (INSERT OR REPLACE это переживает), но не потеряем.
+        set_sync_state(api_url, token, {"odometer_cursor": f"{c1}|{c2}|{c3}"})
+        total += len(rows)
+        print(f"[turso_upload] odometer: залито {total} строк...")
+    return total
+
+
+def sync_changes(conn, api_url, token, state):
+    """То же для журнала изменений. Курсор — id, он монотонно растёт."""
+    cursor = int(state.get("changes_cursor") or 0)
+    cols = ["local_id", "plate", "detected_at", "change_kind",
+            "field", "field_label", "old_value", "new_value"]
+    total = 0
+    while True:
+        rows = conn.execute(
+            """
+            SELECT id, plate, detected_at, change_kind, field, field_label, old_value, new_value
+            FROM field_changes WHERE id > ? ORDER BY id LIMIT ?
+            """, (cursor, BATCH_ROWS)
+        ).fetchall()
+        if not rows:
+            break
+        _upload_chunk(api_url, token, "changes", cols, [tuple(r) for r in rows])
+        cursor = rows[-1][0]
+        set_sync_state(api_url, token, {"changes_cursor": cursor})
+        total += len(rows)
+        print(f"[turso_upload] changes: залито {total} строк...")
+    return total
 
 
 def build_insert_statements(table: str, columns: list, rows: list) -> list:
@@ -253,55 +316,21 @@ def run(db_path: str = None):
     pipeline(api_url, token, SCHEMA_STATEMENTS)
 
     state = get_sync_state(api_url, token)
-    print(f"[turso_upload] Отметки прошлой заливки: {state or 'нет (первый прогон, зальём всё)'}")
+    print(f"[turso_upload] Курсоры прошлой заливки: {state or 'нет (первый прогон, зальём всё)'}")
 
     conn = sqlite3.connect(db_path)
     try:
-        data = collect_rows(conn, state)
-        # Новые отметки считаем по тому, что реально лежит в локальной базе.
-        row = conn.execute("SELECT MAX(first_seen_at) FROM odometer_readings").fetchone()
-        new_reading_seen = row[0] if row else None
-        row = conn.execute("SELECT MAX(id) FROM field_changes").fetchone()
-        new_change_id = row[0] if row else None
+        odo = sync_odometer(conn, api_url, token, state)
+        changes = sync_changes(conn, api_url, token, state)
     finally:
         conn.close()
 
-    total = sum(len(rows) for _, rows in data.values())
-    if total == 0:
+    uploaded = odo + changes
+    if uploaded == 0:
         print("[turso_upload] Новых данных с прошлой заливки нет — заливать нечего.")
-        return {"ok": True, "uploaded": 0}
-
-    for table, (columns, rows) in data.items():
-        print(f"[turso_upload] {table}: {len(rows)} строк к заливке")
-
-    uploaded = 0
-    for table, (columns, rows) in data.items():
-        if not rows:
-            continue
-        statements = build_insert_statements(table, columns, rows)
-        for i in range(0, len(statements), STATEMENTS_PER_REQUEST):
-            batch = statements[i:i + STATEMENTS_PER_REQUEST]
-            try:
-                pipeline(api_url, token, batch)
-            except (urllib.error.URLError, RuntimeError) as e:
-                print(f"[turso_upload] Ошибка заливки в {table} (пачка {i}): {e}")
-                raise
-            uploaded += sum(len(s[1]) // len(columns) for s in batch)
-            print(f"[turso_upload] Залито {uploaded}/{total} строк...")
-
-    # Отметки двигаем ТОЛЬКО после того, как все пачки реально уехали:
-    # если заливка упадёт посередине, при следующем запуске мы честно начнём
-    # с прошлой отметки и дошлём всё заново (INSERT OR REPLACE это переживёт).
-    updates = {}
-    if new_reading_seen:
-        updates["last_reading_seen"] = new_reading_seen
-    if new_change_id:
-        updates["last_change_id"] = new_change_id
-    if updates:
-        set_sync_state(api_url, token, updates)
-        print(f"[turso_upload] Отметки синхронизации обновлены: {updates}")
-
-    print(f"[turso_upload] Готово: {uploaded} строк в Turso.")
+    else:
+        print(f"[turso_upload] Готово: {uploaded} строк в Turso "
+              f"(odometer {odo}, changes {changes}).")
     return {"ok": True, "uploaded": uploaded}
 
 
