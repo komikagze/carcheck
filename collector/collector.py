@@ -48,6 +48,7 @@ from datetime import datetime
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # чтобы видеть shared/
 
 from shared.refdata import (COLLECTED_RESOURCES, COLLECTED_RESOURCE_FIELDS, DATASET_SLUGS,
+                            TRACKED_MAIN_FIELDS,
                             TRACKED_FIELD_LABELS)
 from collector import config, db, meta
 from collector import api_loader
@@ -297,6 +298,88 @@ def process_ownership_resource(conn, resource, snapshot_id, row_count):
     return {"new_ownership_rows": inserted, "row_count": row_count}
 
 
+def process_main_resource(conn, snapshot_id, detected_at, row_count):
+    """Диффит поля ОСНОВНОГО реестра (цвет, VIN, тип владения, топливо, модель
+    двигателя, код модели) против current_state_main и пишет отличия в тот же
+    журнал field_changes, что и изменения из ресурса history.
+
+    Зачем: эти поля рассказывают о машине то, чего не видно по километражу —
+    перекрас (смена цвета), перебитый VIN, уход в прокат/лизинг, переделка
+    на газ, замена агрегата на другую модель."""
+    cols = list(TRACKED_MAIN_FIELDS.keys())
+    sel_new = ", ".join(f"s.{c} AS new_{c}" for c in cols)
+    sel_old = ", ".join(f"m.{c} AS old_{c}" for c in cols)
+    # Отличие хотя бы по одному полю; NULL и '' считаем одним и тем же
+    # "нет значения", иначе полезли бы фантомные изменения.
+    where_diff = " OR ".join(f"IFNULL(m.{c},'') != IFNULL(s.{c},'')" for c in cols)
+
+    cur = conn.execute(f"""
+        SELECT CAST(CAST(TRIM(s.mispar_rechev) AS INTEGER) AS TEXT) AS plate,
+               m.plate AS existing_plate,
+               {sel_new}, {sel_old}
+        FROM staging_main s
+        -- Тот же приём, что и в process_history_resource: CAST AS INTEGER
+        -- нормализует ведущие нули, внешний CAST AS TEXT сохраняет
+        -- работоспособность индекса (без него — SCAN на каждую строку).
+        LEFT JOIN current_state_main m
+               ON m.plate = CAST(CAST(TRIM(s.mispar_rechev) AS INTEGER) AS TEXT)
+        WHERE s.mispar_rechev IS NOT NULL AND TRIM(s.mispar_rechev) != ''
+          AND (m.plate IS NULL OR {where_diff})
+    """)
+
+    changed_count = 0
+    new_count = 0
+    field_changes_batch = []
+    state_batch = []
+
+    def flush():
+        nonlocal field_changes_batch, state_batch
+        if field_changes_batch:
+            conn.executemany(
+                "INSERT INTO field_changes (plate, detected_at, snapshot_id, change_kind, "
+                "field, field_label, old_value, new_value) VALUES (?,?,?,?,?,?,?,?)",
+                field_changes_batch)
+            field_changes_batch = []
+        if state_batch:
+            set_clause = ", ".join(f"{c}=excluded.{c}" for c in cols)
+            conn.executemany(
+                f"INSERT INTO current_state_main (plate, {', '.join(cols)}, updated_at) "
+                f"VALUES ({', '.join(['?'] * (len(cols) + 2))}) "
+                f"ON CONFLICT(plate) DO UPDATE SET {set_clause}, updated_at=excluded.updated_at",
+                state_batch)
+            state_batch = []
+
+    with db.transaction(conn):
+        for row in cur:
+            plate = row["plate"]
+            if plate is None:
+                continue
+            is_new = row["existing_plate"] is None
+
+            if is_new:
+                new_count += 1
+            else:
+                for c in cols:
+                    old_val, new_val = row[f"old_{c}"], row[f"new_{c}"]
+                    if (old_val or "") == (new_val or ""):
+                        continue
+                    changed_count += 1
+                    field_changes_batch.append((
+                        plate, detected_at, snapshot_id, "changed", c,
+                        TRACKED_MAIN_FIELDS[c],
+                        None if old_val is None else str(old_val),
+                        None if new_val is None else str(new_val),
+                    ))
+
+            state_batch.append(tuple([plate] + [row[f"new_{c}"] for c in cols] + [detected_at]))
+            if len(state_batch) >= config.BATCH_SIZE:
+                flush()
+        flush()
+
+    logger.info("main: новых машин в реестре=%d, изменений полей=%d", new_count, changed_count)
+    return {"new_plates": new_count, "changed_fields": changed_count, "row_count": row_count}
+
+
 def run_resource(conn, resource_key, resource_id, resources_by_id, run_stats):
     res = resources_by_id.get(resource_id)
     if res is None:
@@ -390,9 +473,10 @@ def run_resource(conn, resource_key, resource_id, resources_by_id, run_stats):
     if resource_key == "history":
         stats = process_history_resource(conn, resource_ctx, resource_id, taken_at, row_count)
     elif resource_key == "main":
-        # Основной реестр сам по себе не диффим — он нужен только как источник
-        # даты теста. Его staging используется ниже, в build_odometer_readings().
-        stats = {"row_count": row_count}
+        # Основной реестр даёт две вещи: дату теста (её забирает
+        # build_odometer_readings ниже) и свой набор полей для журнала
+        # изменений — цвет, VIN, тип владения, топливо, модель двигателя.
+        stats = process_main_resource(conn, snapshot_id, taken_at, row_count)
     else:
         stats = process_ownership_resource(conn, resource_ctx, snapshot_id, row_count)
 

@@ -108,6 +108,23 @@ CREATE TABLE IF NOT EXISTS odometer_anomalies (
 );
 CREATE INDEX IF NOT EXISTS idx_odometer_anomalies_plate ON odometer_anomalies(plate);
 
+-- Текущее состояние полей ОСНОВНОГО РЕЕСТРА по каждой машине (цвет, VIN, тип
+-- владения, топливо, модель двигателя, код модели). Отдельно от current_state
+-- намеренно: та таблица живёт по данным ресурса history и обновляется своим
+-- проходом, а смешивать два источника в одной строке — верный способ,
+-- чтобы один затирал поля другого.
+CREATE TABLE IF NOT EXISTS current_state_main (
+    plate        TEXT PRIMARY KEY,
+    tzeva_rechev TEXT,
+    misgeret     TEXT,
+    baalut       TEXT,
+    sug_delek_nm TEXT,
+    degem_manoa  TEXT,
+    degem_cd     TEXT,
+    degem_nm     TEXT,
+    updated_at   TEXT NOT NULL
+);
+
 -- Показания одометра с ПРИВЯЗКОЙ К ДАТЕ ТЕСТА (а не к дате нашего прогона).
 -- Собирается join-ом ресурса history (там километраж) и основного реестра
 -- (там mivchan_acharon_dt — дата теста); поодиночке ни один из них полной
