@@ -207,10 +207,14 @@ def build_report(plate_raw: str) -> dict:
 
     ownership_records = results["ownership"]["records"]
     if ownership_records:
-        sorted_recs = sorted(ownership_records, key=lambda r: r.get("baalut_dt") or 0)
+        sorted_recs = sorted(ownership_records, key=lambda r: str(r.get("baalut_dt") or ""))
+        # Отдаём СЫРЫЕ даты (YYYYMM) и тип, а не готовые подписи: анализ владения
+        # (сколько времени у каждого владельца, перекупщики, частая перепродажа)
+        # считается в интерфейсе, чтобы логика жила в одном месте и одинаково
+        # работала и на локальном сервере, и на статическом сайте.
         report["ownership"]["records"] = [
-            {"index": i + 1, "type": translate_val(r.get("baalut")), "since": fmt_date(r.get("baalut_dt"))}
-            for i, r in enumerate(sorted_recs)
+            {"baalut_dt": str(r.get("baalut_dt") or ""), "baalut": r.get("baalut")}
+            for r in sorted_recs
         ]
 
     for rid, period in SCRAPPED_RESOURCES:

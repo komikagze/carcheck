@@ -231,20 +231,117 @@ function renderTavNeche(records) {
   </div>`;
 }
 
+// ---- анализ истории владения ----
+// Перекупщик (סוחר) владельцем НЕ считается: машина у него не эксплуатируется,
+// это транзит между настоящими владельцами. Поэтому "יד N" нумеруются только
+// по реальным владельцам, а проходы через перекупщика показываются отдельно.
+const DEALER = "סוחר";
+
+// Даты владения приходят с точностью до месяца (YYYYMM) — это ограничение
+// самого data.gov.il, дня там нет.
+function parseOwnMonth(v) {
+  const s = String(v || "");
+  if (/^\d{6}$/.test(s) || /^\d{8}$/.test(s)) {
+    return { y: +s.slice(0, 4), m: +s.slice(4, 6) };
+  }
+  return null;
+}
+
+const monthsBetween = (a, b) => (b.y - a.y) * 12 + (b.m - a.m);
+
+function monthsText(n) {
+  if (n == null) return "";
+  if (n < 1) return "פחות מחודש";
+  const y = Math.floor(n / 12), m = n % 12;
+  const parts = [];
+  if (y === 1) parts.push("שנה");
+  else if (y === 2) parts.push("שנתיים");
+  else if (y > 2) parts.push(`${y} שנים`);
+  if (m === 1) parts.push("חודש");
+  else if (m === 2) parts.push("חודשיים");
+  else if (m > 2) parts.push(`${m} חודשים`);
+  return parts.join(" ו-");
+}
+
+const fmtOwnMonth = (d) => (d ? `${String(d.m).padStart(2, "0")}.${d.y}` : "—");
+
+function analyzeOwnership(records) {
+  const now = new Date();
+  const today = { y: now.getFullYear(), m: now.getMonth() + 1 };
+
+  const items = records
+    .map(r => ({ date: parseOwnMonth(r.baalut_dt), type: r.baalut || "—" }))
+    .filter(r => r.date)
+    .sort((a, b) => (a.date.y - b.date.y) || (a.date.m - b.date.m));
+
+  let handNo = 0;
+  items.forEach((it, i) => {
+    const next = items[i + 1];
+    it.months = monthsBetween(it.date, next ? next.date : today);
+    it.isDealer = it.type === DEALER;
+    it.isCurrent = !next;
+    if (!it.isDealer) it.hand = ++handNo;
+  });
+
+  const realOwners = items.filter(i => !i.isDealer);
+  const dealerPasses = items.filter(i => i.isDealer).length;
+
+  // Сигналы быстрой перепродажи. Пороги подобраны так, чтобы не срабатывать
+  // на обычной машине (купил -> ездил годами -> продал), но ловить ситуацию
+  // "машину гоняют по рукам", которая часто означает скрытую проблему.
+  const flags = [];
+  if (dealerPasses >= 3) {
+    flags.push(`הרכב עבר ${dealerPasses} פעמים דרך סוחר`);
+  }
+  const quick = realOwners.filter(o => !o.isCurrent && o.months < 12).length;
+  if (quick >= 2) {
+    flags.push(`${quick} בעלים החזיקו את הרכב פחות משנה`);
+  }
+  return { items, realOwners, dealerPasses, flags };
+}
+
 function renderOwnership(records) {
   if (!records || records.length === 0) {
     return `<div class="section-title">היסטוריית בעלות</div><div class="card"><div class="empty">אין נתונים — מאגר זה מכסה רק רכבים משנת 2017 ואילך.</div></div>`;
   }
-  const sorted = records.slice().sort((a, b) => (a.baalut_dt || 0) - (b.baalut_dt || 0));
-  const rows = sorted.map((r, i) => {
-    const d = String(r.baalut_dt || "");
-    const when = /^\d{6}$/.test(d) ? `${d.slice(4, 6)}.${d.slice(0, 4)}` : d;
-    return `<div class="row"><span class="k">יד ${i + 1}</span><span class="v">${esc(translateVal(r.baalut) || "—")}${when ? ` · מ-${esc(when)}` : ""}</span></div>`;
+  const a = analyzeOwnership(records);
+  if (!a.items.length) {
+    return `<div class="section-title">היסטוריית בעלות</div><div class="card"><div class="empty">אין נתונים — מאגר זה מכסה רק רכבים משנת 2017 ואילך.</div></div>`;
+  }
+
+  const rows = a.items.map(it => {
+    const who = it.isDealer
+      ? `<span style="color:var(--muted);">מעבר דרך סוחר</span>`
+      : `יד ${it.hand}`;
+    const dur = it.isCurrent ? `${monthsText(it.months)} (עד היום)` : monthsText(it.months);
+    return `<tr>
+      <td>${who}</td>
+      <td>${esc(it.type)}</td>
+      <td>${fmtOwnMonth(it.date)}</td>
+      <td>${dur}</td>
+    </tr>`;
   }).join("");
+
+  const warn = a.flags.length
+    ? `<div class="alert-block" style="margin-top:12px;">
+         <div class="alert-title">⚠️ סימני החלפות ידיים תכופות</div>
+         ${a.flags.map(f => `<div class="row" style="border-bottom:none;"><span class="v">${esc(f)}</span></div>`).join("")}
+         <div class="src">רכב שעובר הרבה ידיים בזמן קצר — סיבה לבדוק אותו ביסודיות אצל מוסך.</div>
+       </div>`
+    : "";
+
   return `<div class="section-title">היסטוריית בעלות</div><div class="card">
-      <div class="row"><span class="k">סה"כ בעלים</span><span class="v">${records.length}</span></div>
-      ${rows}
-      <div class="src">מקור: היסטוריית כלי רכב פרטיים (2). שמות הבעלים אינם מתפרסמים על ידי המדינה. הכיסוי — רק רכבים משנת 2017 ואילך.</div>
+      <div class="row"><span class="k">בעלים אמיתיים</span><span class="v">${a.realOwners.length}</span></div>
+      <div class="row"><span class="k">מעברים דרך סוחר</span><span class="v">${a.dealerPasses}</span></div>
+      <div style="overflow-x:auto;margin-top:8px;">
+        <table class="odo-table"><thead><tr>
+          <th>יד</th><th>סוג בעלות</th><th>מאז</th><th>משך ההחזקה</th>
+        </tr></thead><tbody>${rows}</tbody></table>
+      </div>
+      ${warn}
+      <div class="src">מקור: היסטוריית כלי רכב פרטיים (2). שמות הבעלים אינם מתפרסמים על ידי המדינה.
+      סוחר אינו נספר כבעלים — הרכב אינו בשימוש אצלו, זו רק תחנת מעבר.
+      התאריכים ברמת חודש (כך הם מתפרסמים). הכיסוי — רק רכבים משנת 2017 ואילך.</div>
     </div>`;
 }
 
