@@ -32,6 +32,7 @@ server/live_api.py и в браузерной версии export/dist_template/
 
 import hashlib
 import json
+import urllib.parse
 import urllib.request
 
 from shared.refdata import API_BASE
@@ -41,9 +42,15 @@ USER_AGENT = "carcheck-collector/1.0 (personal use, github.com/local)"
 PAGE_SIZE = 500000
 
 
-def _fetch_page(resource_id: str, offset: int, limit: int, timeout=None):
+def _fetch_page(resource_id: str, offset: int, limit: int, timeout=None, fields=None):
     timeout = timeout or config.DOWNLOAD_TIMEOUT
     url = f"{API_BASE}?resource_id={resource_id}&limit={limit}&offset={offset}"
+    if fields:
+        # Просим у API только нужные колонки. Для основного реестра это 2 поля
+        # вместо 24 — на 4.2 млн строк разница в разы по трафику и по памяти
+        # (без этого процесс на загрузке реестра разрастался до ~2 ГБ, что
+        # рискованно для раннера GitHub Actions).
+        url += "&fields=" + urllib.parse.quote(",".join(fields))
     req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         raw = resp.read()
@@ -53,7 +60,8 @@ def _fetch_page(resource_id: str, offset: int, limit: int, timeout=None):
     return data["result"], raw
 
 
-def load_resource_to_staging(conn, resource_id: str, staging_table: str, archive_writer=None) -> dict:
+def load_resource_to_staging(conn, resource_id: str, staging_table: str, archive_writer=None,
+                              fields=None) -> dict:
     """Постранично тянет ВСЕ строки ресурса через datastore_search и грузит их
     в staging_table (пересоздаётся заново, как раньше делал csv_loader).
 
@@ -79,7 +87,7 @@ def load_resource_to_staging(conn, resource_id: str, staging_table: str, archive
     # Оборачиваем всю загрузку страницы в один explicit BEGIN/COMMIT.
     with db.transaction(conn):
         while True:
-            result, raw = _fetch_page(resource_id, offset, PAGE_SIZE)
+            result, raw = _fetch_page(resource_id, offset, PAGE_SIZE, fields=fields)
             sha256.update(raw)
             if archive_writer:
                 archive_writer(raw)

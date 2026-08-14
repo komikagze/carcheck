@@ -108,6 +108,41 @@ CREATE TABLE IF NOT EXISTS odometer_anomalies (
 );
 CREATE INDEX IF NOT EXISTS idx_odometer_anomalies_plate ON odometer_anomalies(plate);
 
+-- Показания одометра с ПРИВЯЗКОЙ К ДАТЕ ТЕСТА (а не к дате нашего прогона).
+-- Собирается join-ом ресурса history (там километраж) и основного реестра
+-- (там mivchan_acharon_dt — дата теста); поодиночке ни один из них полной
+-- картины не даёт. PRIMARY KEY (plate, test_date) + INSERT OR IGNORE делают
+-- накопление идемпотентным: каждый тест попадает в историю ровно один раз,
+-- сколько бы раз сборщик ни запускался.
+CREATE TABLE IF NOT EXISTS odometer_readings (
+    plate         TEXT NOT NULL,
+    test_date     TEXT NOT NULL,   -- дата теста по данным Минтранса (YYYY-MM-DD)
+    km            INTEGER,
+    first_seen_at TEXT NOT NULL,   -- когда наш сборщик впервые увидел эту запись
+    PRIMARY KEY (plate, test_date)
+);
+
+-- Подробный журнал изменений: одна строка на КАЖДОЕ изменившееся поле,
+-- с человекочитаемым названием поля и значениями "было -> стало".
+-- Таблицы history/engine_changes/odometer_anomalies выше хранят только новые
+-- значения и сам факт изменения; здесь же — полная понятная летопись, из
+-- которой видно "когда, что и как поменялось" без расшифровки JSON-полей.
+-- change_kind: 'new_car'  — машина впервые появилась в базе (поля пустые),
+--              'changed'  — у уже известной машины изменилось конкретное поле.
+CREATE TABLE IF NOT EXISTS field_changes (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    plate        TEXT NOT NULL,
+    detected_at  TEXT NOT NULL,
+    snapshot_id  INTEGER NOT NULL,
+    change_kind  TEXT NOT NULL,
+    field        TEXT,
+    field_label  TEXT,
+    old_value    TEXT,
+    new_value    TEXT,
+    FOREIGN KEY(snapshot_id) REFERENCES snapshots(snapshot_id)
+);
+CREATE INDEX IF NOT EXISTS idx_field_changes_plate ON field_changes(plate, detected_at);
+
 CREATE TABLE IF NOT EXISTS meta_archive (
     id               INTEGER PRIMARY KEY AUTOINCREMENT,
     dataset_slug     TEXT NOT NULL,
@@ -142,6 +177,31 @@ def get_connection(db_path: str = None) -> sqlite3.Connection:
 def init_db(conn: sqlite3.Connection):
     with conn:
         conn.executescript(SCHEMA_SQL)
+
+
+def backfill_initial_changes(conn: sqlite3.Connection) -> int:
+    """Одноразовая досыпка журнала изменений для машин, которые попали в базу
+    ДО появления таблицы field_changes (у нас это первый реальный прогон —
+    2.4 млн машин уехали в current_state, когда журнала ещё не существовало).
+
+    Без этого в журнале была бы дыра: машины есть, а записи "когда добавлена" нет.
+    Выполняется только если журнал пуст, а current_state — нет, поэтому
+    повторные запуски ничего не дублируют."""
+    already = conn.execute("SELECT 1 FROM field_changes LIMIT 1").fetchone()
+    if already:
+        return 0
+    has_state = conn.execute("SELECT 1 FROM current_state LIMIT 1").fetchone()
+    if not has_state:
+        return 0
+
+    with transaction(conn):
+        cur = conn.execute("""
+            INSERT INTO field_changes
+                (plate, detected_at, snapshot_id, change_kind, field, field_label, old_value, new_value)
+            SELECT plate, updated_at, snapshot_id, 'new_car', NULL, NULL, NULL, NULL
+            FROM current_state
+        """)
+        return cur.rowcount
 
 
 @contextlib.contextmanager

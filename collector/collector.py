@@ -6,10 +6,14 @@ collector/collector.py — точка входа сборщика. Запуск�
 
 Алгоритм (см. Часть 1 BRIEF.md; ОБНОВЛЕНО после первого реального прогона — см.
 collector/api_loader.py про то, почему шаг 3 теперь не скачивание CSV):
-  1. package_show(shinui_mivne) -> реальные url/last_modified для двух ресурсов,
-     которые мы копим: history (56063a99...) и ownership (bb2355dc...). url
-     сейчас используется только для записи в snapshots.source_url (для справки),
-     сами данные тянутся через JSON API — см. пункт 3.
+  1. package_show по двум пакетам -> реальные url/last_modified для трёх ресурсов,
+     которые мы копим: history (56063a99...) и ownership (bb2355dc...) лежат
+     в пакете shinui_mivne, основной реестр (053cea08...) — в пакете
+     private-and-commercial-vehicles. Основной реестр нужен ради единственного
+     поля mivchan_acharon_dt (дата теста): в history её нет, а без неё
+     непонятно, на какую дату снят километраж. url сейчас используется только
+     для записи в snapshots.source_url (для справки), сами данные тянутся
+     через JSON API — см. пункт 3.
   2. Если last_modified не изменился с прошлого снимка — пропускаем ресурс, выходим.
   3. Тянем ВСЕ строки ресурса постранично через JSON API datastore_search
      (collector/api_loader.py) — НЕ скачиванием сырого CSV с e.data.gov.il, тот
@@ -43,7 +47,8 @@ from datetime import datetime
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # чтобы видеть shared/
 
-from shared.refdata import COLLECTED_RESOURCES, DATASET_SLUGS
+from shared.refdata import (COLLECTED_RESOURCES, COLLECTED_RESOURCE_FIELDS, DATASET_SLUGS,
+                            TRACKED_FIELD_LABELS)
 from collector import config, db, meta
 from collector import api_loader
 
@@ -110,7 +115,18 @@ def process_history_resource(conn, resource, resource_id, snapshot_taken_at, row
             c.mkoriut_nm AS old_mkoriut,
             c.snapshot_id AS old_snapshot_id
         FROM staging_history s
-        LEFT JOIN current_state c ON c.plate = TRIM(s.mispar_rechev)
+        -- ВАЖНО, две вещи разом (обе проверены на живых данных):
+        --  1) нормализация. В current_state номер лежит без ведущих нулей
+        --     (их срезает CAST AS INTEGER при вставке), а из API приходит вида
+        --     '07488339'. Если джойнить просто по TRIM, такие машины никогда
+        --     не найдутся и КАЖДУЮ неделю будут считаться новыми заново.
+        --  2) тип. Внешний CAST(... AS TEXT) обязателен: без него сравнение
+        --     TEXT-колонки с INTEGER-выражением не даёт SQLite использовать
+        --     индекс, и план вырождается в SCAN current_state на каждую строку
+        --     staging (2.4 млн x 2.4 млн — прогон висел 16+ минут без движения).
+        --     С CAST AS TEXT план становится SEARCH ... (plate=?).
+        LEFT JOIN current_state c
+               ON c.plate = CAST(CAST(TRIM(s.mispar_rechev) AS INTEGER) AS TEXT)
         WHERE s.mispar_rechev IS NOT NULL AND TRIM(s.mispar_rechev) != ''
           AND (
             c.plate IS NULL
@@ -136,9 +152,30 @@ def process_history_resource(conn, resource, resource_id, snapshot_taken_at, row
     engine_batch = []
     anomaly_batch = []
     state_batch = []
+    field_changes_batch = []
+
+    # (внутреннее имя поля, ключ старого значения в строке, ключ нового значения).
+    # Таблицей, а не семью почти одинаковыми if-ами — чтобы добавить новое
+    # отслеживаемое поле можно было одной строкой здесь и одной в
+    # TRACKED_FIELD_LABELS (shared/refdata.py).
+    TRACKED = [
+        ("km", "old_km", "new_km"),
+        ("engine_no", "old_engine", "new_engine"),
+        ("shinui_mivne_ind", "old_shinui_mivne", "new_shinui_mivne"),
+        ("gapam_ind", "old_gapam", "new_gapam"),
+        ("shnui_zeva_ind", "old_shnui_zeva", "new_shnui_zeva"),
+        ("shinui_zmig_ind", "old_shinui_zmig", "new_shinui_zmig"),
+        ("mkoriut_nm", "old_mkoriut", "new_mkoriut"),
+    ]
 
     def flush():
-        nonlocal history_batch, engine_batch, anomaly_batch, state_batch
+        nonlocal history_batch, engine_batch, anomaly_batch, state_batch, field_changes_batch
+        if field_changes_batch:
+            conn.executemany(
+                "INSERT INTO field_changes (plate, detected_at, snapshot_id, change_kind, "
+                "field, field_label, old_value, new_value) VALUES (?,?,?,?,?,?,?,?)",
+                field_changes_batch)
+            field_changes_batch = []
         if history_batch:
             conn.executemany(
                 "INSERT INTO history (plate, snapshot_id, km, engine_no, changed_fields, detected_at) "
@@ -183,21 +220,24 @@ def process_history_resource(conn, resource, resource_id, snapshot_taken_at, row
 
             if is_new:
                 new_plate_count += 1
+                # Отдельной строкой в журнал: машина впервые появилась в базе.
+                # Не расписываем по каждому полю — сравнивать было не с чем.
+                field_changes_batch.append(
+                    (plate, detected_at, snapshot_id, "new_car", None, None, None, None))
             else:
-                if row["old_km"] != row["new_km"]:
-                    changed_fields.append("km")
-                if (row["old_engine"] or "") != (row["new_engine"] or ""):
-                    changed_fields.append("engine_no")
-                if row["old_shinui_mivne"] != row["new_shinui_mivne"]:
-                    changed_fields.append("shinui_mivne_ind")
-                if row["old_gapam"] != row["new_gapam"]:
-                    changed_fields.append("gapam_ind")
-                if row["old_shnui_zeva"] != row["new_shnui_zeva"]:
-                    changed_fields.append("shnui_zeva_ind")
-                if row["old_shinui_zmig"] != row["new_shinui_zmig"]:
-                    changed_fields.append("shinui_zmig_ind")
-                if (row["old_mkoriut"] or "") != (row["new_mkoriut"] or ""):
-                    changed_fields.append("mkoriut_nm")
+                for field, old_key, new_key in TRACKED:
+                    old_val, new_val = row[old_key], row[new_key]
+                    # Пустая строка и NULL — для нас одно и то же "нет значения",
+                    # иначе появлялись бы фантомные изменения '' -> None.
+                    if (old_val or "") == (new_val or ""):
+                        continue
+                    changed_fields.append(field)
+                    field_changes_batch.append((
+                        plate, detected_at, snapshot_id, "changed", field,
+                        TRACKED_FIELD_LABELS.get(field, field),
+                        None if old_val is None else str(old_val),
+                        None if new_val is None else str(new_val),
+                    ))
 
                 if changed_fields:
                     changed_count += 1
@@ -217,6 +257,14 @@ def process_history_resource(conn, resource, resource_id, snapshot_taken_at, row
                     anomaly_count += 1
                     anomaly_batch.append((plate, row["old_km"], row["new_km"], detected_at,
                                            row["old_snapshot_id"], snapshot_id))
+                    # В журнал — отдельной строкой с типом 'anomaly', чтобы такое
+                    # событие было видно в общей ленте изменений, а не только
+                    # в отдельной таблице аномалий.
+                    field_changes_batch.append((
+                        plate, detected_at, snapshot_id, "anomaly", "km",
+                        TRACKED_FIELD_LABELS.get("km", "km"),
+                        str(row["old_km"]), str(row["new_km"]),
+                    ))
 
             state_batch.append((plate, row["new_km"], row["new_engine"], row["new_shinui_mivne"],
                                  row["new_gapam"], row["new_shnui_zeva"], row["new_shinui_zmig"],
@@ -252,13 +300,20 @@ def process_ownership_resource(conn, resource, snapshot_id, row_count):
 def run_resource(conn, resource_key, resource_id, resources_by_id, run_stats):
     res = resources_by_id.get(resource_id)
     if res is None:
-        logger.error("Ресурс %s не найден в package_show(shinui_mivne) — пропуск", resource_id)
+        logger.error("Ресурс %s не найден ни в одном package_show — пропуск", resource_id)
         return
 
     last_modified = res.get("last_modified")
     prev_snapshot = last_snapshot_for(conn, resource_id)
 
-    if prev_snapshot is not None and prev_snapshot["last_modified"] == last_modified:
+    # CARCHECK_FORCE=1 — пересобрать, даже если у источника ничего не менялось.
+    # Нужно, когда поменялась НАША схема (например, добавили odometer_readings
+    # и надо наполнить таблицу задним числом): иначе сборщик честно скажет
+    # "last_modified не изменился" и новая таблица останется пустой до тех пор,
+    # пока Минтранс не обновит данные.
+    force = os.environ.get("CARCHECK_FORCE") == "1"
+
+    if not force and prev_snapshot is not None and prev_snapshot["last_modified"] == last_modified:
         logger.info("[%s] last_modified не изменился (%s) — снимок пропущен", resource_key, last_modified)
         run_stats[resource_key] = {"skipped": True, "reason": "last_modified не изменился"}
         return
@@ -266,7 +321,7 @@ def run_resource(conn, resource_key, resource_id, resources_by_id, run_stats):
     logger.info("[%s] last_modified изменился (было %s, стало %s) — тяну через JSON API",
                 resource_key, prev_snapshot["last_modified"] if prev_snapshot else None, last_modified)
 
-    staging_table = "staging_history" if resource_key == "history" else "staging_ownership"
+    staging_table = f"staging_{resource_key}"
     date_tag = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
     archive_path = os.path.join(config.ARCHIVE_DIR, resource_id, f"{date_tag}.jsonl.gz")
     os.makedirs(os.path.dirname(archive_path), exist_ok=True)
@@ -277,8 +332,11 @@ def run_resource(conn, resource_key, resource_id, resources_by_id, run_stats):
             archive_file.write(raw_bytes)
             archive_file.write(b"\n")
         try:
-            load_stats = api_loader.load_resource_to_staging(conn, resource_id, staging_table,
-                                                               archive_writer=archive_writer)
+            load_stats = api_loader.load_resource_to_staging(
+                conn, resource_id, staging_table,
+                archive_writer=archive_writer,
+                fields=COLLECTED_RESOURCE_FIELDS.get(resource_key),
+            )
         except Exception as e:
             logger.error("[%s] загрузка через JSON API не удалась: %s", resource_key, e)
             run_stats[resource_key] = {"error": str(e)}
@@ -290,26 +348,40 @@ def run_resource(conn, resource_key, resource_id, resources_by_id, run_stats):
     row_count = load_stats["row_count"]
     logger.info("staging_%s: %s строк (через JSON API, постранично)", resource_key, row_count)
 
-    if prev_snapshot is not None and prev_snapshot["sha256"] == sha256:
+    if not force and prev_snapshot is not None and prev_snapshot["sha256"] == sha256:
         logger.info("[%s] sha256 совпал с прошлым снимком, содержимое не изменилось — снимок пропущен", resource_key)
         run_stats[resource_key] = {"skipped": True, "reason": "sha256 совпал"}
         os.remove(archive_path)
-        with db.transaction(conn):
-            conn.execute(f'DROP TABLE IF EXISTS "{staging_table}"')
+        # staging специально НЕ удаляем здесь: даже если этот ресурс не изменился,
+        # его staging может понадобиться build_odometer_readings() для джойна
+        # с другим ресурсом, который изменился. Уберёт drop_staging_tables() в конце.
         return
 
     logger.info("[%s] сохранён снимок в %s (%d строк, %.1f МБ сжато)",
                 resource_key, archive_path, row_count, os.path.getsize(archive_path) / 1e6)
 
     taken_at = datetime.utcnow().isoformat()
-    with db.transaction(conn):
-        cur = conn.execute(
-            "INSERT INTO snapshots (resource_id, taken_at, source_url, last_modified, sha256, row_count, file_path) "
-            "VALUES (?,?,?,?,?,?,?)",
-            (resource_id, taken_at, res["url"], last_modified, sha256, row_count,
-             os.path.relpath(archive_path, config.BASE_DIR)),
-        )
-        snapshot_id = cur.lastrowid
+    # При CARCHECK_FORCE=1 содержимое может совпасть с уже сохранённым снимком,
+    # а в snapshots стоит UNIQUE(resource_id, sha256) — поэтому не вставляем
+    # дубликат, а переиспользуем существующий snapshot_id.
+    existing_same = conn.execute(
+        "SELECT snapshot_id FROM snapshots WHERE resource_id=? AND sha256=?",
+        (resource_id, sha256),
+    ).fetchone()
+    if existing_same:
+        snapshot_id = existing_same["snapshot_id"]
+        logger.info("[%s] содержимое идентично уже сохранённому снимку #%s — переиспользую его",
+                    resource_key, snapshot_id)
+        os.remove(archive_path)
+    else:
+        with db.transaction(conn):
+            cur = conn.execute(
+                "INSERT INTO snapshots (resource_id, taken_at, source_url, last_modified, sha256, row_count, file_path) "
+                "VALUES (?,?,?,?,?,?,?)",
+                (resource_id, taken_at, res["url"], last_modified, sha256, row_count,
+                 os.path.relpath(archive_path, config.BASE_DIR)),
+            )
+            snapshot_id = cur.lastrowid
 
     resource_ctx = dict(res)
     resource_ctx["_snapshot_id"] = snapshot_id
@@ -317,18 +389,80 @@ def run_resource(conn, resource_key, resource_id, resources_by_id, run_stats):
 
     if resource_key == "history":
         stats = process_history_resource(conn, resource_ctx, resource_id, taken_at, row_count)
+    elif resource_key == "main":
+        # Основной реестр сам по себе не диффим — он нужен только как источник
+        # даты теста. Его staging используется ниже, в build_odometer_readings().
+        stats = {"row_count": row_count}
     else:
         stats = process_ownership_resource(conn, resource_ctx, snapshot_id, row_count)
 
-    # staging — временная рабочая таблица (см. api_loader.py), в базе постоянно
-    # храниться не должна: она дублирует те же данные, что уже разложены по
-    # current_state/ownership, и на миллионах строк заметно раздувает файл БД
-    # (обнаружено на первом реальном прогоне — carcheck.sqlite3 распух почти
-    # до 1.2 ГБ, что и в git не запушить, и незачем).
-    with db.transaction(conn):
-        conn.execute(f'DROP TABLE IF EXISTS "{staging_table}"')
-
     run_stats[resource_key] = stats
+
+
+def build_odometer_readings(conn, seen_at):
+    """Склеивает километраж (ресурс history) с датой теста (основной реестр)
+    и копит их в odometer_readings — именно это даёт историю вида
+    "пробег X на тесте от такого-то числа".
+
+    INSERT OR IGNORE + PRIMARY KEY (plate, test_date): каждый тест попадает
+    в историю ровно один раз, повторные прогоны ничего не дублируют."""
+    tables = {r[0] for r in conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name IN "
+        "('staging_history','staging_main')")}
+    if {"staging_history", "staging_main"} - tables:
+        logger.info("odometer_readings: пропуск — нет свежих staging_history/staging_main "
+                    "(ресурсы не обновлялись в этот прогон)")
+        return 0
+
+    # Индекс ПО ВЫРАЖЕНИЮ — без него JOIN двух staging-таблиц по нормализованному
+    # номеру вырождается в SCAN staging_main на каждую строку staging_history
+    # (2.4 млн x 4.2 млн). Обычный индекс по сырой колонке тут не работает:
+    # сравниваем не её, а результат CAST-ов. Проверено через EXPLAIN QUERY PLAN.
+    with db.transaction(conn):
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_staging_main_plate_norm "
+                     "ON staging_main(CAST(CAST(TRIM(mispar_rechev) AS INTEGER) AS TEXT))")
+
+    with db.transaction(conn):
+        cur = conn.execute("""
+            INSERT OR IGNORE INTO odometer_readings (plate, test_date, km, first_seen_at)
+            -- Номер нормализуем так же, как в current_state: CAST AS INTEGER
+            -- срезает ведущие нули, внешний CAST AS TEXT приводит тип к тому же,
+            -- что в колонке (иначе теряется индекс — см. комментарий выше).
+            SELECT CAST(CAST(TRIM(h.mispar_rechev) AS INTEGER) AS TEXT),
+                   m.mivchan_acharon_dt,
+                   CAST(h.kilometer_test_aharon AS INTEGER),
+                   ?
+            FROM staging_history h
+            JOIN staging_main m
+              ON CAST(CAST(TRIM(m.mispar_rechev) AS INTEGER) AS TEXT)
+               = CAST(CAST(TRIM(h.mispar_rechev) AS INTEGER) AS TEXT)
+            WHERE h.kilometer_test_aharon IS NOT NULL
+              AND TRIM(IFNULL(h.kilometer_test_aharon,'')) != ''
+              AND m.mivchan_acharon_dt IS NOT NULL
+              AND TRIM(IFNULL(m.mivchan_acharon_dt,'')) != ''
+        """, (seen_at,))
+        added = cur.rowcount
+    total = conn.execute("SELECT COUNT(*) FROM odometer_readings").fetchone()[0]
+    logger.info("odometer_readings: добавлено %d новых показаний с датой теста (всего в базе %d)",
+                added, total)
+    return added
+
+
+def drop_staging_tables(conn):
+    """staging — временные рабочие таблицы (см. api_loader.py), в базе постоянно
+    храниться не должны: они дублируют данные, уже разложенные по
+    current_state/ownership/odometer_readings, и на миллионах строк заметно
+    раздувают файл БД (обнаружено на первом реальном прогоне — carcheck.sqlite3
+    распух почти до 1.2 ГБ, что и в git не запушить, и незачем).
+    Удаляем в самом конце, а не сразу после каждого ресурса, потому что
+    build_odometer_readings() джойнит staging_history со staging_main."""
+    names = [r[0] for r in conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'staging_%'")]
+    for name in names:
+        with db.transaction(conn):
+            conn.execute(f'DROP TABLE IF EXISTS "{name}"')
+    if names:
+        logger.info("staging: удалены временные таблицы (%s)", ", ".join(names))
 
 
 def main():
@@ -338,6 +472,11 @@ def main():
     conn = db.get_connection()
     db.init_db(conn)
 
+    backfilled = db.backfill_initial_changes(conn)
+    if backfilled:
+        logger.info("journal: досыпано %d записей 'машина добавлена' за первый прогон "
+                    "(таблицы field_changes тогда ещё не было)", backfilled)
+
     with db.transaction(conn):
         cur = conn.execute("INSERT INTO run_log (started_at, status) VALUES (?, 'running')",
                             (datetime.utcnow().isoformat(),))
@@ -346,11 +485,20 @@ def main():
     run_stats = {}
     error_message = None
     try:
-        package = meta.retry(meta.package_show, 3, 10, "shinui_mivne")
-        resources_by_id = {r["id"]: r for r in package.get("resources", [])}
+        # Собираемые ресурсы лежат в РАЗНЫХ пакетах: history и ownership —
+        # в shinui_mivne, основной реестр — в private-and-commercial-vehicles.
+        # Поэтому спрашиваем package_show по обоим и объединяем их ресурсы.
+        resources_by_id = {}
+        for slug in ("shinui_mivne", DATASET_SLUGS["main_registry"]):
+            package = meta.retry(meta.package_show, 3, 10, slug)
+            for r in package.get("resources", []):
+                resources_by_id[r["id"]] = r
 
         for key, resource_id in COLLECTED_RESOURCES.items():
             run_resource(conn, key, resource_id, resources_by_id, run_stats)
+
+        build_odometer_readings(conn, datetime.utcnow().isoformat())
+        drop_staging_tables(conn)
 
         archive_meta(conn)
 

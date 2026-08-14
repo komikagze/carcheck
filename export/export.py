@@ -10,8 +10,9 @@ export/export.py — сборка статики (Часть 4 ТЗ, с учёт
     перебрать скриптом (300-999 файлов) и вытащить всю базу без всякого логина.
   - Теперь — накопленная история отдаётся ТОЛЬКО поштучно, по одному номеру,
     через Cloudflare Pages Function (functions/api/history/[plate].js), которая
-    читает Cloudflare KV. Массовой выгрузки через сайт не существует в принципе.
-    Наполнение KV делает отдельный скрипт export/kv_upload.py (шаг workflow).
+    делает SELECT по одному номеру в Turso. Массовой выгрузки через сайт не
+    существует в принципе.
+    Наполнение базы делает отдельный скрипт export/turso_upload.py (шаг workflow).
 
 Что делает ИМЕННО ЭТОТ файл:
   1. Копирует статический интерфейс (export/dist_template/*, включая
@@ -85,7 +86,7 @@ def run(db_path: str = None):
 
     print(f"[export] Готово: dist/ = {DIST_DIR} (агрегированные счётчики: "
           f"{meta['plates_covered']} машин, {meta['snapshots_count']} снимков). "
-          f"Данные по конкретным машинам сюда не публикуются — см. export/kv_upload.py.")
+          f"Данные по конкретным машинам сюда не публикуются — см. export/turso_upload.py.")
     return {"ok": True, "dist_dir": DIST_DIR, "meta": meta}
 
 

@@ -40,37 +40,35 @@ def get_local_data(plate: str) -> dict:
         return {"available": True, "odometer_series": [], "engine_changes": [], "anomalies": [], "note": None}
 
     try:
-        odometer_series = [
+        # ВСЕ показания одометра, от новых к старым (первая строка = последний
+        # тест). Даты — РЕАЛЬНЫЕ даты тестов из odometer_readings, а не дата
+        # нашего прогона; см. collector.build_odometer_readings().
+        odometer = [
             dict(row) for row in conn.execute(
                 """
-                SELECT h.detected_at, h.km, s.taken_at AS snapshot_taken_at
-                FROM history h
-                JOIN snapshots s ON s.snapshot_id = h.snapshot_id
-                WHERE h.plate = ? AND h.km IS NOT NULL
-                ORDER BY h.detected_at ASC
-                """, (plate_int,)
+                SELECT test_date, km FROM odometer_readings
+                WHERE plate = ? AND km IS NOT NULL
+                ORDER BY test_date DESC
+                """, (str(plate_int),)
             ).fetchall()
         ]
-        # добавим самое первое (текущее на момент первого снимка) значение, если current_state есть
-        # и в history для этой машины ещё не было ни одной записи (новая машина в базе)
-        current = conn.execute(
-            "SELECT km, updated_at FROM current_state WHERE plate=?", (plate_int,)
-        ).fetchone()
-        if current and not odometer_series:
-            odometer_series = [{"detected_at": current["updated_at"], "km": current["km"],
-                                 "snapshot_taken_at": current["updated_at"]}]
-        elif current:
-            last = odometer_series[-1]
-            if last["km"] != current["km"]:
-                odometer_series.append({"detected_at": current["updated_at"], "km": current["km"],
-                                         "snapshot_taken_at": current["updated_at"]})
+
+        # Подробный журнал "когда, что, было -> стало".
+        changes = [
+            dict(row) for row in conn.execute(
+                """
+                SELECT detected_at, change_kind, field, field_label, old_value, new_value
+                FROM field_changes WHERE plate = ? ORDER BY detected_at ASC, id ASC
+                """, (str(plate_int),)
+            ).fetchall()
+        ]
 
         engine_changes = [
             dict(row) for row in conn.execute(
                 """
                 SELECT old_engine, new_engine, detected_at, km_at_change
                 FROM engine_changes WHERE plate=? ORDER BY detected_at ASC
-                """, (plate_int,)
+                """, (str(plate_int),)
             ).fetchall()
         ]
 
@@ -79,7 +77,7 @@ def get_local_data(plate: str) -> dict:
                 """
                 SELECT prev_km, new_km, detected_at
                 FROM odometer_anomalies WHERE plate=? ORDER BY detected_at ASC
-                """, (plate_int,)
+                """, (str(plate_int),)
             ).fetchall()
         ]
 
@@ -87,14 +85,15 @@ def get_local_data(plate: str) -> dict:
             dict(row) for row in conn.execute(
                 """
                 SELECT baalut_dt, baalut FROM ownership WHERE plate=? ORDER BY baalut_dt ASC
-                """, (plate_int,)
+                """, (str(plate_int),)
             ).fetchall()
         ]
 
         return {
             "available": True,
             "note": None,
-            "odometer_series": odometer_series,
+            "odometer": odometer,
+            "changes": changes,
             "engine_changes": engine_changes,
             "anomalies": anomalies,
             "ownership_local": ownership_local,
