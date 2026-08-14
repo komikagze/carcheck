@@ -172,7 +172,27 @@ TCP-соединения к Postgres/MySQL**. Хранилищу обязате�
 - ✅ Turso: база создана, `TURSO_DATABASE_URL` и `TURSO_AUTH_TOKEN` заведены
   в GitHub Secrets **и** в переменных окружения Cloudflare Pages
 - ✅ GitHub Actions: включены права «Read and write permissions»
-- ✅ Cloudflare Pages: проект подключён к ветке `gh-pages`
+- ❌ **Cloudflare Pages: проект НЕ создан.** Проверено 14.08 через коннектор:
+  `workers_list` вернул `{"workers":[],"count":0}`, в дашборде «No projects found».
+  Раньше в этом документе стояло «подключён» — это была ошибка, записанная
+  со слов без проверки.
+
+  При этом всё остальное для него готово: ветка `gh-pages` существует и
+  содержит собранный сайт (`index.html`, `static/`, `functions/`, `meta.json`).
+  Не хватает только самого проекта Pages, который это раздаст.
+
+  **Создаётся только руками в браузере** — Cloudflare требует OAuth-связки
+  с GitHub-аккаунтом, программного доступа к этой операции нет (у коннектора
+  есть инструменты только для KV, D1, R2 и Workers, создания Pages среди них нет):
+  Workers & Pages → Create application → Pages → Connect to Git → репозиторий
+  `carcheck` → **Production branch `gh-pages`** (не `main`) → Build command
+  пустой → Output directory `/` → Save and Deploy.
+  После деплоя: Settings → Environment variables → `TURSO_DATABASE_URL`
+  и `TURSO_AUTH_TOKEN`.
+
+  **Частая путаница:** «мы же отказались от Cloudflare» — отказались только от
+  его базы **KV**. Cloudflare **Pages** — это хостинг, он по-прежнему нужен.
+  Turso хранит данные, но показать сайт людям не может.
 - ⚠️ Старые секреты `CF_API_TOKEN`, `CF_ACCOUNT_ID`, `CF_KV_NAMESPACE_ID` и
   KV namespace `carcheck-history` **больше не используются** — можно удалить
 
@@ -232,9 +252,29 @@ gh api "repos/komikagze/carcheck/actions/runs?per_page=3" \
 (в старом было `Залито N/4872409`).
 
 ## 4.2 После успешной заливки — проверить сайт живьём
-Открыть `https://carcheck.pages.dev` (или свой домен), проверить тестовые
-номера. Убедиться, что блок «היסטוריה שנצברה» показывает данные из Turso,
-а не «история не накоплена».
+
+⚠️ **Точный адрес сайта пока неизвестен — его надо взять из панели Cloudflare**
+(dash.cloudflare.com → Workers & Pages → проект, привязанный к ветке `gh-pages`).
+
+**`https://carcheck.pages.dev` — НЕ наш сайт.** Проверено 14.08.2026: адрес
+занят посторонним проектом, там англоязычный лендинг iOS-приложения
+«Car Photo Checklist» (`carphotochecklist.com`), отдаёт 200. В README этот
+адрес был просто примером («или на своём домене»), но принять его за наш —
+готовая ловушка: сайт отвечает, только чужой. Поддомен `*.pages.dev` Cloudflare
+выдаёт по имени проекта, а `carcheck` кем-то уже занят.
+
+Проверены и не резолвятся вообще (то есть наш адрес не из них):
+`carcheck-komikagze`, `komikagze-carcheck`, `carcheck-il`, `carcheck-history`.
+
+Когда адрес известен — проверить тестовые номера из §7 и убедиться, что блок
+«היסטוריה שנצברה» показывает данные из Turso, а не «история не накоплена».
+Быстрая проверка без браузера:
+```bash
+curl -s "https://<адрес>/api/history/24497602" | head -c 400
+```
+
+Не путать с URL **базы**: `libsql://carcheck-komikagze.aws-ap-northeast-1.turso.io`
+— это Turso, туда ходит серверная функция, а не браузер.
 
 ## 4.3 Заполнится само со временем (не баг, так задумано)
 
