@@ -1,10 +1,29 @@
-// export/dist_template/functions/api/history/[plate].js
+// export/dist_template/worker/index.js
 //
-// Cloudflare Pages Function. Отдаёт накопленную историю ОДНОЙ конкретной машины
+// Cloudflare Worker. Отдаёт накопленную историю ОДНОЙ конкретной машины
 // по номеру — и только так: единственный способ прочитать данные из хранилища
 // на этом сайте. Никакого эндпоинта "дай список всех номеров" или "дай весь
 // дамп" не существует в принципе, поэтому массово скачать всю базу через сайт
 // нельзя, даже без всякого логина на сам поиск.
+//
+// ПОЧЕМУ WORKER, А НЕ PAGES FUNCTION (важно, не переигрывать).
+// Раньше это был файл functions/api/history/[plate].js — Pages Function с
+// маршрутизацией по имени файла. В августе 2026 выяснилось, что Cloudflare
+// убрал создание новых проектов Pages из панели: в диалоге "Create" остались
+// только Workers. Проверено вживую — вкладки Pages нет, а официальный гайд
+// теперь называется "Migrate from Pages to Workers".
+//
+// Cloudflare предлагает компилировать папку functions/ в воркер командой
+// `wrangler pages functions build`. Мы этого НЕ делаем: маршрут ровно один,
+// точка входа была ровно одна, и обвязка занимает полтора десятка строк.
+// Отказ от шага сборки убирает из конвейера npm-зависимость и команду, которую
+// сам Cloudflare называет переходной. Логика запросов к Turso, рейт-лимит и
+// формат ответа ниже — не менялись при переезде вообще.
+//
+// СТАТИКА отдаётся не отсюда: она лежит в public/ и раздаётся механизмом
+// static assets (см. wrangler.jsonc, поле assets.directory). Ассеты имеют
+// приоритет, и до воркера доходит только то, что не совпало ни с одним файлом,
+// то есть фактически /api/*. Поэтому адреса страниц не изменились.
 //
 // ХРАНИЛИЩЕ: Turso (облачный SQLite), а не Cloudflare KV.
 // Почему поменяли: на бесплатном тарифе KV разрешает всего 1000 операций записи
@@ -12,10 +31,12 @@
 // бесплатно 5 ГБ, 10 млн записей строк в месяц и 500 млн чтений. Подробности
 // и разбор альтернатив — в README и в export/turso_upload.py.
 //
-// Требует две переменные окружения проекта Cloudflare Pages:
-//   TURSO_DATABASE_URL  — https://<база>-<организация>.turso.io
+// Требует две переменные окружения воркера:
+//   TURSO_DATABASE_URL  — libsql://<база>-<организация>.turso.io
 //   TURSO_AUTH_TOKEN    — токен доступа к базе
-// (Settings -> Environment variables, см. README.)
+// Заводить в панели: воркер -> Settings -> Variables and Secrets, тип Secret.
+// (У Pages это называлось Environment variables — отсюда путаница в старых
+// заметках. Pages-проекта у нас нет и не было.)
 //
 // Анти-скрапинг: рейт-лимит по IP на той же базе (таблица rate_limit, корзина
 // на минуту). Это НЕ железная защита — при желании её можно обойти (менять IP,
@@ -96,9 +117,7 @@ function rowsOf(result) {
   });
 }
 
-export async function onRequestGet(context) {
-  const { params, request, env } = context;
-
+async function handleHistory(request, env, rawPlate) {
   if (!env.TURSO_DATABASE_URL || !env.TURSO_AUTH_TOKEN) {
     return jsonResponse(
       { error: "אחסון ההיסטוריה אינו מוגדר (TURSO_DATABASE_URL / TURSO_AUTH_TOKEN). ראו README." },
@@ -107,8 +126,7 @@ export async function onRequestGet(context) {
   }
 
   // --- валидация номера: только цифры, разумная длина ---
-  const rawPlate = String(params.plate || "");
-  const digitsOnly = rawPlate.replace(/\D/g, "");
+  const digitsOnly = String(rawPlate || "").replace(/\D/g, "");
   if (!digitsOnly || digitsOnly.length > 10) {
     return jsonResponse({ error: "מספר רכב לא תקין." }, 400);
   }
@@ -186,3 +204,23 @@ export async function onRequestGet(context) {
     return jsonResponse({ error: `שגיאה בקריאת ההיסטוריה: ${e.message}` }, 502);
   }
 }
+
+// Единственная точка входа воркера. Сюда попадает только то, что не совпало
+// со статическим файлом из public/ — см. шапку файла. Маршрут ровно один:
+// GET /api/history/<номер>. Всё остальное — 404 обычным JSON-ответом, чтобы
+// клиент всегда получал предсказуемый формат.
+export default {
+  async fetch(request, env) {
+    const { pathname } = new URL(request.url);
+    const match = pathname.match(/^\/api\/history\/([^/]+)\/?$/);
+
+    if (!match) {
+      return jsonResponse({ error: "לא נמצא." }, 404);
+    }
+    if (request.method !== "GET") {
+      return jsonResponse({ error: "שיטה לא נתמכת." }, 405);
+    }
+
+    return handleHistory(request, env, decodeURIComponent(match[1]));
+  },
+};
