@@ -265,7 +265,47 @@ function monthsText(n) {
 
 const fmtOwnMonth = (d) => (d ? `${String(d.m).padStart(2, "0")}.${d.y}` : "—");
 
-function analyzeOwnership(records) {
+// Дата теста одометра (YYYY-MM-DD) -> {y,m} для сравнения с датами владения.
+function parseTestMonth(v) {
+  const s = String(v || "");
+  const m = s.match(/^(\d{4})-(\d{2})/);
+  if (m) return { y: +m[1], m: +m[2] };
+  if (/^\d{8}$/.test(s) || /^\d{6}$/.test(s)) return { y: +s.slice(0, 4), m: +s.slice(4, 6) };
+  return null;
+}
+
+const cmpMonth = (a, b) => (a.y - b.y) || (a.m - b.m);
+
+// Последнее показание одометра НЕ ПОЗЖЕ указанного месяца.
+function kmAt(odometer, when) {
+  let best = null;
+  for (const p of odometer || []) {
+    if (p.km == null) continue;
+    const d = parseTestMonth(p.test_date);
+    if (!d || cmpMonth(d, when) > 0) continue;
+    if (!best || cmpMonth(d, best.d) > 0) best = { d, km: Number(p.km) };
+  }
+  return best;
+}
+
+// Сколько километров проехали за период владения. Считается по разнице
+// показаний одометра на его границах. Вернёт null, если подходящих показаний
+// нет — а так будет почти всегда, пока история не накопится: государство
+// публикует только ПОСЛЕДНИЙ пробег, всё остальное копим мы сами, начиная
+// с первого прогона сборщика.
+function kmDriven(odometer, from, to) {
+  const a = kmAt(odometer, from);
+  const b = kmAt(odometer, to);
+  if (!a || !b) return null;
+  if (cmpMonth(a.d, b.d) === 0) return null;   // одно и то же показание — разницы нет
+  const diff = b.km - a.km;
+  return diff >= 0 ? diff : null;
+}
+
+// Строит список периодов владения. Перекупщик (סוחר) своей строки не получает
+// и номер руки не увеличивает: он показывается тонкой строкой-перемычкой между
+// владельцами, потому что машина у него не эксплуатируется.
+function analyzeOwnership(records, odometer) {
   const now = new Date();
   const today = { y: now.getFullYear(), m: now.getMonth() + 1 };
 
@@ -274,16 +314,51 @@ function analyzeOwnership(records) {
     .filter(r => r.date)
     .sort((a, b) => (a.date.y - b.date.y) || (a.date.m - b.date.m));
 
-  let handNo = 0;
+  // Конец периода каждой записи — начало следующей (неважно, владелец это
+  // или перекуп): именно так владение и заканчивается фактически.
   items.forEach((it, i) => {
     const next = items[i + 1];
-    it.months = monthsBetween(it.date, next ? next.date : today);
-    it.isDealer = it.type === DEALER;
+    it.end = next ? next.date : today;
     it.isCurrent = !next;
-    if (!it.isDealer) it.hand = ++handNo;
+    it.isDealer = it.type === DEALER;
   });
 
-  const realOwners = items.filter(i => !i.isDealer);
+  const rows = [];
+  let hand = 0;
+  let pendingDealers = [];
+
+  for (const it of items) {
+    if (it.isDealer) { pendingDealers.push(it); continue; }
+    if (pendingDealers.length) {
+      rows.push({
+        kind: "transit",
+        count: pendingDealers.length,
+        months: monthsBetween(pendingDealers[0].date, it.date),
+      });
+      pendingDealers = [];
+    }
+    rows.push({
+      kind: "owner",
+      hand: ++hand,
+      type: it.type,
+      from: it.date,
+      to: it.end,
+      isCurrent: it.isCurrent,
+      months: monthsBetween(it.date, it.end),
+      km: kmDriven(odometer, it.date, it.end),
+    });
+  }
+  // Машина прямо сейчас стоит у перекупщика — тоже честно показываем.
+  if (pendingDealers.length) {
+    rows.push({
+      kind: "transit",
+      count: pendingDealers.length,
+      months: monthsBetween(pendingDealers[0].date, today),
+      isCurrent: true,
+    });
+  }
+
+  const owners = rows.filter(r => r.kind === "owner");
   const dealerPasses = items.filter(i => i.isDealer).length;
 
   // Сигналы быстрой перепродажи. Пороги подобраны так, чтобы не срабатывать
@@ -293,34 +368,37 @@ function analyzeOwnership(records) {
   if (dealerPasses >= 3) {
     flags.push(`הרכב עבר ${dealerPasses} פעמים דרך סוחר`);
   }
-  const quick = realOwners.filter(o => !o.isCurrent && o.months < 12).length;
+  const quick = owners.filter(o => !o.isCurrent && o.months < 12).length;
   if (quick >= 2) {
     flags.push(`${quick} בעלים החזיקו את הרכב פחות משנה`);
   }
-  return { items, realOwners, dealerPasses, flags };
+  return { rows, owners, dealerPasses, flags };
 }
 
-function renderOwnership(records) {
-  if (!records || records.length === 0) {
-    return `<div class="section-title">היסטוריית בעלות</div><div class="card"><div class="empty">אין נתונים — מאגר זה מכסה רק רכבים משנת 2017 ואילך.</div></div>`;
-  }
-  const a = analyzeOwnership(records);
-  if (!a.items.length) {
-    return `<div class="section-title">היסטוריית בעלות</div><div class="card"><div class="empty">אין נתונים — מאגר זה מכסה רק רכבים משנת 2017 ואילך.</div></div>`;
-  }
-
-  const rows = a.items.map(it => {
-    const who = it.isDealer
-      ? `<span style="color:var(--muted);">מעבר דרך סוחר</span>`
-      : `יד ${it.hand}`;
-    const dur = it.isCurrent ? `${monthsText(it.months)} (עד היום)` : monthsText(it.months);
+function renderOwnershipRows(a) {
+  return a.rows.map(r => {
+    if (r.kind === "transit") {
+      const when = r.isCurrent ? " — הרכב אצלו כעת" : "";
+      return `<tr><td colspan="5" style="color:var(--muted);font-size:12px;padding:4px;">
+        ⟵ עבר דרך סוחר ${r.count > 1 ? `${r.count} פעמים` : ""} (${monthsText(r.months)})${when}
+      </td></tr>`;
+    }
     return `<tr>
-      <td>${who}</td>
-      <td>${esc(it.type)}</td>
-      <td>${fmtOwnMonth(it.date)}</td>
-      <td>${dur}</td>
+      <td><b>יד ${r.hand}</b></td>
+      <td>${esc(r.type)}</td>
+      <td>${fmtOwnMonth(r.from)} – ${r.isCurrent ? "היום" : fmtOwnMonth(r.to)}</td>
+      <td>${monthsText(r.months)}</td>
+      <td>${r.km == null ? "—" : Number(r.km).toLocaleString("he-IL") + ' ק"מ'}</td>
     </tr>`;
   }).join("");
+}
+
+function renderOwnership(records, odometer) {
+  const empty = `<div class="section-title">היסטוריית בעלות</div><div class="card">
+      <div class="empty">אין נתונים — מאגר זה מכסה רק רכבים משנת 2017 ואילך.</div></div>`;
+  if (!records || !records.length) return empty;
+  const a = analyzeOwnership(records, odometer);
+  if (!a.owners.length && !a.rows.length) return empty;
 
   const warn = a.flags.length
     ? `<div class="alert-block" style="margin-top:12px;">
@@ -330,19 +408,23 @@ function renderOwnership(records) {
        </div>`
     : "";
 
+  const noKm = a.owners.every(o => o.km == null);
+
   return `<div class="section-title">היסטוריית בעלות</div><div class="card">
-      <div class="row"><span class="k">בעלים אמיתיים</span><span class="v">${a.realOwners.length}</span></div>
-      <div class="row"><span class="k">מעברים דרך סוחר</span><span class="v">${a.dealerPasses}</span></div>
-      <div style="overflow-x:auto;margin-top:8px;">
-        <table class="odo-table"><thead><tr>
-          <th>יד</th><th>סוג בעלות</th><th>מאז</th><th>משך ההחזקה</th>
-        </tr></thead><tbody>${rows}</tbody></table>
-      </div>
-      ${warn}
-      <div class="src">מקור: היסטוריית כלי רכב פרטיים (2). שמות הבעלים אינם מתפרסמים על ידי המדינה.
-      סוחר אינו נספר כבעלים — הרכב אינו בשימוש אצלו, זו רק תחנת מעבר.
-      התאריכים ברמת חודש (כך הם מתפרסמים). הכיסוי — רק רכבים משנת 2017 ואילך.</div>
-    </div>`;
+    <div class="row"><span class="k">מספר ידיים</span><span class="v">${a.owners.length}</span></div>
+    <div class="row"><span class="k">מעברים דרך סוחר</span><span class="v">${a.dealerPasses}</span></div>
+    <div style="overflow-x:auto;margin-top:8px;">
+      <table class="odo-table"><thead><tr>
+        <th>יד</th><th>סוג בעלות</th><th>תקופה</th><th>משך</th><th>ק"מ שנסע</th>
+      </tr></thead><tbody>${renderOwnershipRows(a)}</tbody></table>
+    </div>
+    ${warn}
+    <div class="src">מקור: היסטוריית כלי רכב פרטיים (2). שמות הבעלים אינם מתפרסמים על ידי המדינה.
+    סוחר אינו נספר כיד — הרכב אינו בשימוש אצלו, זו רק תחנת מעבר בין בעלים.
+    התאריכים ברמת חודש (כך הם מתפרסמים). הכיסוי — רק רכבים משנת 2017 ואילך.
+    ${noKm ? `עמודת הק"מ תתמלא ככל שתצטבר היסטוריית מבחני רישוי: המדינה מפרסמת
+    רק את הקילומטראז' האחרון, את השאר אנחנו צוברים בעצמנו מרגע ההפעלה.` : ""}</div>
+  </div>`;
 }
 
 function renderInactive(records) {
@@ -639,7 +721,9 @@ async function search() {
   html += renderUsage(taxiData.records, importData.records);
   html += renderInactive(inactiveData.records);
   html += `<div class="section-title">תו נכה</div>` + renderTavNeche(tavNecheData.records);
-  html += renderOwnership(ownershipData.records);
+  // Пробег по владельцам считается из накопленных показаний одометра,
+  // поэтому передаём их сюда же.
+  html += renderOwnership(ownershipData.records, (accumulatedHistory || {}).odometer);
   html += `<div class="section-title">בטיחות וריקולים</div>`;
   html += renderRecalls(recallData.records);
   html += renderAdas(adasData.records);
