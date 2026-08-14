@@ -199,42 +199,22 @@ function analyzeOwnership(records, odometer) {
     it.isDealer = it.type === DEALER;
   });
 
-  const rows = [];
+  // Одна строка на каждую запись. Номер руки получают только настоящие
+  // владельцы; у перекупщика ячейка руки пустая, и километраж ему тоже
+  // не считается — машина у него не эксплуатируется, это тоже транзит.
   let hand = 0;
-  let pendingDealers = [];
-
   for (const it of items) {
-    if (it.isDealer) { pendingDealers.push(it); continue; }
-    if (pendingDealers.length) {
-      rows.push({
-        kind: "transit",
-        count: pendingDealers.length,
-        months: monthsBetween(pendingDealers[0].date, it.date),
-      });
-      pendingDealers = [];
+    if (it.isDealer) {
+      it.hand = null;
+      it.km = null;
+    } else {
+      it.hand = ++hand;
+      it.km = kmDriven(odometer, it.date, it.end);
     }
-    rows.push({
-      kind: "owner",
-      hand: ++hand,
-      type: it.type,
-      from: it.date,
-      to: it.end,
-      isCurrent: it.isCurrent,
-      months: monthsBetween(it.date, it.end),
-      km: kmDriven(odometer, it.date, it.end),
-    });
-  }
-  // Машина прямо сейчас стоит у перекупщика — тоже честно показываем.
-  if (pendingDealers.length) {
-    rows.push({
-      kind: "transit",
-      count: pendingDealers.length,
-      months: monthsBetween(pendingDealers[0].date, today),
-      isCurrent: true,
-    });
+    it.months = monthsBetween(it.date, it.end);
   }
 
-  const owners = rows.filter(r => r.kind === "owner");
+  const owners = items.filter(i => !i.isDealer);
   const dealerPasses = items.filter(i => i.isDealer).length;
 
   // Сигналы быстрой перепродажи. Пороги подобраны так, чтобы не срабатывать
@@ -248,23 +228,22 @@ function analyzeOwnership(records, odometer) {
   if (quick >= 2) {
     flags.push(`${quick} בעלים החזיקו את הרכב פחות משנה`);
   }
-  return { rows, owners, dealerPasses, flags };
+  return { items, owners, dealerPasses, flags };
 }
 
 function renderOwnershipRows(a) {
-  return a.rows.map(r => {
-    if (r.kind === "transit") {
-      const when = r.isCurrent ? " — הרכב אצלו כעת" : "";
-      return `<tr><td colspan="5" style="color:var(--muted);font-size:12px;padding:4px;">
-        ⟵ עבר דרך סוחר ${r.count > 1 ? `${r.count} פעמים` : ""} (${monthsText(r.months)})${when}
-      </td></tr>`;
-    }
-    return `<tr>
-      <td><b>יד ${r.hand}</b></td>
-      <td>${esc(r.type)}</td>
-      <td>${fmtOwnMonth(r.from)} – ${r.isCurrent ? "היום" : fmtOwnMonth(r.to)}</td>
-      <td>${monthsText(r.months)}</td>
-      <td>${r.km == null ? "—" : Number(r.km).toLocaleString("he-IL") + ' ק"מ'}</td>
+  return a.items.map(it => {
+    const hand = it.isDealer ? "" : `<b>יד ${it.hand}</b>`;
+    const dur = monthsText(it.months) + (it.isCurrent ? " (עד היום)" : "");
+    // Километраж у перекупщика — всегда пусто (не применимо), у владельца
+    // прочерк означает "пока не знаем", это разные вещи.
+    const km = it.isDealer ? "" : (it.km == null ? "—" : Number(it.km).toLocaleString("he-IL") + ' ק"מ');
+    return `<tr${it.isDealer ? ' style="color:var(--muted);"' : ""}>
+      <td>${hand}</td>
+      <td>${esc(it.type)}</td>
+      <td>${fmtOwnMonth(it.date)}</td>
+      <td>${dur}</td>
+      <td>${km}</td>
     </tr>`;
   }).join("");
 }
@@ -274,7 +253,7 @@ function renderOwnership(records, odometer) {
       <div class="empty">אין נתונים — מאגר זה מכסה רק רכבים משנת 2017 ואילך.</div></div>`;
   if (!records || !records.length) return empty;
   const a = analyzeOwnership(records, odometer);
-  if (!a.owners.length && !a.rows.length) return empty;
+  if (!a.items.length) return empty;
 
   const warn = a.flags.length
     ? `<div class="alert-block" style="margin-top:12px;">
@@ -291,7 +270,7 @@ function renderOwnership(records, odometer) {
     <div class="row"><span class="k">מעברים דרך סוחר</span><span class="v">${a.dealerPasses}</span></div>
     <div style="overflow-x:auto;margin-top:8px;">
       <table class="odo-table"><thead><tr>
-        <th>יד</th><th>סוג בעלות</th><th>תקופה</th><th>משך</th><th>ק"מ שנסע</th>
+        <th>יד</th><th>סוג בעלות</th><th>מאז</th><th>משך ההחזקה</th><th>ק"מ שנסע</th>
       </tr></thead><tbody>${renderOwnershipRows(a)}</tbody></table>
     </div>
     ${warn}
