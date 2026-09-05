@@ -37,3 +37,8 @@ Thumbs.db
 
 # Локальные настройки Claude Code (не часть проекта)
 .claude/
+
+# ключ Gemini API — НЕ коммитить
+carimages/.gemini_key
+.gemini_key
+*.key
