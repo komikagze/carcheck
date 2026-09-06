@@ -54,11 +54,19 @@ def get_local_data(plate: str) -> dict:
         ]
 
         # Подробный журнал "когда, что, было -> стало".
+        #
+        # change_kind != 'new_car' — то же условие, что в боевом воркере
+        # (export/dist_template/worker/index.js). Записи "машина увидена
+        # впервые" пустые (field/old_value/new_value = NULL) и рисовались
+        # строкой с прочерками, не сообщая ничего. Условие продублировано
+        # осознанно: без него локальный предпросмотр показывал бы строку,
+        # которой в проде нет, и разница гонялась бы как призрачный баг.
         changes = [
             dict(row) for row in conn.execute(
                 """
                 SELECT detected_at, change_kind, field, field_label, old_value, new_value
-                FROM field_changes WHERE plate = ? ORDER BY detected_at ASC, id ASC
+                FROM field_changes WHERE plate = ? AND change_kind != 'new_car'
+                ORDER BY detected_at ASC, id ASC
                 """, (str(plate_int),)
             ).fetchall()
         ]

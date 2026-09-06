@@ -32,14 +32,35 @@ server/live_api.py и в браузерной версии export/dist_template/
 
 import hashlib
 import json
+import logging
+import time
+import urllib.error
 import urllib.parse
 import urllib.request
 
 from shared.refdata import API_BASE
 from . import config, db
 
+log = logging.getLogger(__name__)
+
 USER_AGENT = "carcheck-collector/1.0 (personal use, github.com/local)"
+
+# Размер страницы. Начинаем с большого и УМЕНЬШАЕМ на лету, если портал отбил
+# запрос (см. _fetch_page_adaptive).
+#
+# ПОЧЕМУ так, а не просто константа (обнаружено 06.09.2026 на живых запросах):
+# с 24.08 основной реестр перестал отдаваться именно на limit=500000 — портал
+# возвращает 404 МГНОВЕННО (0.1 с, то есть это отказ шлюза, а не таймаут).
+# Замерено вживую по одному и тому же ресурсу 053cea08:
+#     limit=300000 -> 200, 69 МБ, 6.4 с
+#     limit=500000 -> 404 за 0.1 с
+# При этом history на limit=500000 в тот же момент отдаётся нормально (111 МБ),
+# и сам реестр на limit=300000 тоже. То есть ресурс жив, отбивается конкретная
+# комбинация, и порог у портала может поехать снова в любую сторону. Поэтому
+# размер страницы не зашит намертво, а деградирует сам.
 PAGE_SIZE = 500000
+MIN_PAGE_SIZE = 25000
+FETCH_ATTEMPTS = 4
 
 
 def _fetch_page(resource_id: str, offset: int, limit: int, timeout=None, fields=None):
@@ -60,6 +81,37 @@ def _fetch_page(resource_id: str, offset: int, limit: int, timeout=None, fields=
     return data["result"], raw
 
 
+def _fetch_page_adaptive(resource_id: str, offset: int, limit: int, fields=None):
+    """То же, что _fetch_page, но переживает отказ портала: сначала повторяет
+    запрос, а если не помогло — просит страницу вдвое меньше.
+
+    Возвращает (result, raw, limit) — limit тот, на котором в итоге получилось.
+    Вызывающий код должен продолжать с ним же, иначе следующая страница снова
+    упрётся в тот же отказ.
+    """
+    last_err = None
+    for attempt in range(FETCH_ATTEMPTS):
+        try:
+            result, raw = _fetch_page(resource_id, offset, limit, fields=fields)
+            return result, raw, limit
+        except (urllib.error.URLError, TimeoutError, OSError) as e:
+            last_err = e
+            # Половиним страницу, а не просто ждём: отказ приходит мгновенно и
+            # повторяется стабильно — значит дело в размере запроса, и пауза
+            # сама по себе ничего не изменит.
+            if limit > MIN_PAGE_SIZE:
+                limit = max(MIN_PAGE_SIZE, limit // 2)
+                log.warning("страница отбита (%s) — повторяю с limit=%d", e, limit)
+            else:
+                log.warning("страница отбита (%s) на минимальном limit=%d — повторяю", e, limit)
+            if attempt < FETCH_ATTEMPTS - 1:
+                time.sleep(2 * (attempt + 1))
+    raise RuntimeError(
+        f"datastore_search({resource_id}) не отдал страницу offset={offset} "
+        f"за {FETCH_ATTEMPTS} попыток, последняя ошибка: {last_err}"
+    )
+
+
 def load_resource_to_staging(conn, resource_id: str, staging_table: str, archive_writer=None,
                               fields=None) -> dict:
     """Постранично тянет ВСЕ строки ресурса через datastore_search и грузит их
@@ -77,6 +129,8 @@ def load_resource_to_staging(conn, resource_id: str, staging_table: str, archive
     columns = None
     row_count = 0
     offset = 0
+    page_size = PAGE_SIZE
+    total = None
     sha256 = hashlib.sha256()
 
     # ВАЖНО: conn открыт с isolation_level=None (см. collector/db.py) — без явной
@@ -87,12 +141,19 @@ def load_resource_to_staging(conn, resource_id: str, staging_table: str, archive
     # Оборачиваем всю загрузку страницы в один explicit BEGIN/COMMIT.
     with db.transaction(conn):
         while True:
-            result, raw = _fetch_page(resource_id, offset, PAGE_SIZE, fields=fields)
+            result, raw, page_size = _fetch_page_adaptive(
+                resource_id, offset, page_size, fields=fields)
             sha256.update(raw)
             if archive_writer:
                 archive_writer(raw)
 
             records = result.get("records", [])
+
+            if total is None:
+                # Сколько строк в ресурсе всего. datastore_search отдаёт это в
+                # каждом ответе (include_total) — единственный честный признак,
+                # что мы выкачали ВЕСЬ срез, а не сколько дали.
+                total = result.get("total")
 
             if columns is None:
                 columns = [f["id"] for f in result.get("fields", []) if f["id"] != "_id"]
@@ -107,9 +168,29 @@ def load_resource_to_staging(conn, resource_id: str, staging_table: str, archive
                 conn.executemany(insert_sql, batch)
                 row_count += len(records)
 
-            if len(records) < PAGE_SIZE:
+            # Сдвигаемся на СТОЛЬКО, сколько реально пришло, а не на размер
+            # запрошенной страницы: портал имеет право отдать меньше, и на
+            # фиксированном шаге мы бы молча перепрыгнули через строки.
+            offset += len(records)
+
+            if not records:
                 break
-            offset += PAGE_SIZE
+            if total is not None and row_count >= total:
+                break
+
+        # ЗАЩИТА ОТ ОБРЕЗАННОГО СНИМКА (обнаружено 06.09.2026 при разборе
+        # прогона 24.08). Портал тогда отдал по 32 000 строк вместо 2.4 млн и
+        # 5.4 млн, а старый цикл завершался по условию len(records) < PAGE_SIZE
+        # — то есть принял обрезок за полный срез и записал его в snapshots
+        # как настоящий (записи id 10 и 11, с честным sha256 и архивом).
+        # Для проекта, который живёт сравнением НЕДЕЛЬНЫХ СРЕЗОВ, тихий обрезок
+        # хуже падения: упавший прогон видно сразу, а такой снимок потом ничем
+        # не отличить от настоящего, и сравнивать с ним нельзя.
+        if total is not None and row_count < total:
+            raise RuntimeError(
+                f"datastore_search({resource_id}) отдал {row_count} строк из {total} — "
+                f"снимок неполный, отказываюсь записывать его как срез"
+            )
 
         if columns and "mispar_rechev" in columns:
             conn.execute(f'CREATE INDEX IF NOT EXISTS "idx_{staging_table}_plate" '

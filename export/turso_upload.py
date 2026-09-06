@@ -253,7 +253,30 @@ def sync_odometer(conn, api_url, token, state):
 
 
 def sync_changes(conn, api_url, token, state):
-    """То же для журнала изменений. Курсор — id, он монотонно растёт."""
+    """То же для журнала изменений. Курсор — id, он монотонно растёт.
+
+    Заливаем ТОЛЬКО содержательные записи (field IS NOT NULL), то есть
+    change_kind 'changed' и 'anomaly'. Записи 'new_car' ("машина увидена
+    впервые") остаются дома.
+
+    ПОЧЕМУ (разбор 14.08.2026, цифры перемерены на живой базе 06.09.2026):
+    'new_car' — это 92.8% таблицы (2 464 141 строка из 2 654 350) с пустыми
+    field/old_value/new_value. Про историю конкретной машины они не сообщают
+    ничего, а стоят почти всю месячную квоту Turso: тариф считает индексную
+    запись наравне со строкой, то есть ~2 единицы на строку. Именно на этом
+    квота и выгорела — залито 1.63 млн пустышек, а весь ценный журнал до Turso
+    не доехал, потому что содержательные записи имеют самые большие id и стоят
+    в конце очереди.
+
+    Замер отбора от курсора 1 630 000 (сухой прогон 06.09.2026):
+        без фильтра  1 024 350 строк -> 2 048 700 единиц квоты
+        с фильтром     190 209 строк ->   380 418 единиц квоты
+    Вместе с дельтой одометра прогон стоит ~617 тыс. единиц — 6.2% месячной
+    квоты вместо ~20% без фильтра (и ~98% у полной перезаливки).
+
+    Уже залитые пустышки не удаляем: удаление тоже тратит квоту, а места они
+    занимают немного. Их отсекает воркер при чтении (change_kind != 'new_car').
+    """
     cursor = int(state.get("changes_cursor") or 0)
     cols = ["local_id", "plate", "detected_at", "change_kind",
             "field", "field_label", "old_value", "new_value"]
@@ -262,7 +285,7 @@ def sync_changes(conn, api_url, token, state):
         rows = conn.execute(
             """
             SELECT id, plate, detected_at, change_kind, field, field_label, old_value, new_value
-            FROM field_changes WHERE id > ? ORDER BY id LIMIT ?
+            FROM field_changes WHERE id > ? AND field IS NOT NULL ORDER BY id LIMIT ?
             """, (cursor, BATCH_ROWS)
         ).fetchall()
         if not rows:
