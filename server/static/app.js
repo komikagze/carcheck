@@ -346,10 +346,26 @@ const kmText = (v) => (v == null ? "—" : Number(v).toLocaleString("he-IL") + '
 // Полная история всех тестов + разница между соседними.
 // Приходит уже отсортированной от новых к старым (см. server/history_api.py),
 // поэтому первая строка — последний тест.
-function renderOdometerTable(odometer) {
+// local — весь ответ history_api, из него берутся флаги in_registry и
+// mileage_published. То же различение, что в боевой версии
+// (export/dist_template/public/static/app.js, renderLocalHistory): "пробега
+// по этой машине НЕ БЫВАЕТ" — это не то же самое, что "копим, зайдите позже".
+// Разбор в HANDOFF §6.8-бис.
+function renderOdometerTable(odometer, local) {
   if (!odometer || !odometer.length) {
-    return `<div class="card"><div class="empty">היסטוריית הקילומטראז' של מספר זה טרם נצברה.
-      היא תופיע לאחר ריצה של המאסף שתאסוף גם את מרשם הרכבים (משם מגיע תאריך המבחן).</div></div>`;
+    local = local || {};
+    let msg;
+    if (local.in_registry === false) {
+      msg = `מספר הרכב אינו מופיע במרשם כלי הרכב של משרד התחבורה.`;
+    } else if (local.mileage_published === false) {
+      msg = `משרד התחבורה אינו מפרסם קילומטראז' עבור רכב זה, ולכן היסטוריית
+        קילומטראז' לא תיצבר עבורו — גם לא בעתיד. נתוני הקילומטראז' מתפרסמים רק
+        לרכבים פרטיים משנת 2017 ואילך.`;
+    } else {
+      msg = `היסטוריית הקילומטראז' של מספר זה עדיין לא נצברה אצלנו. נדרשים שני
+        מבחני רישוי שונים כדי להציג מגמה או לזהות גלגול מד אוץ.`;
+    }
+    return `<div class="card"><div class="empty">${msg}</div></div>`;
   }
   const rows = odometer.map((p, i) => {
     const next = odometer[i + 1];   // предыдущий по времени тест
@@ -440,7 +456,7 @@ function renderLocalHistory(local) {
     </div>`;
   }
 
-  html += renderOdometerTable(local.odometer);
+  html += renderOdometerTable(local.odometer, local);
 
   html += renderChangeLog(local.changes);
   return html;

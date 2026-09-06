@@ -538,9 +538,20 @@ const kmText = (v) => (v == null ? "—" : Number(v).toLocaleString("he-IL") + '
 // Полная история всех тестов + разница между соседними.
 // Приходит уже отсортированной от новых к старым (см. Pages Function),
 // поэтому первая строка — последний тест.
-function renderOdometerTable(odometer) {
+// ctx — те же флаги, что у renderLocalHistory. Нужны здесь отдельно: машина
+// может НЕ иметь пробега, но иметь записи в журнале (например, сменился тип
+// владения) — тогда available=true, и пустая таблица пробега рисуется вот тут,
+// мимо проверки в renderLocalHistory. Живой пример: 1871875, Subaru 2013 —
+// пробега нет никогда, а смену "סוחר -> פרטי" от 17.08.2026 мы поймали.
+function renderOdometerTable(odometer, ctx) {
+  ctx = ctx || {};
   if (!odometer || !odometer.length) {
-    return `<div class="card"><div class="empty">טרם נאספו קריאות של מד הקילומטראז'.</div></div>`;
+    const msg = ctx.hasMileageSource === false
+      ? `משרד התחבורה אינו מפרסם קילומטראז' עבור רכב זה (הנתונים מתפרסמים רק
+         לרכבים פרטיים משנת 2017 ואילך), ולכן קריאות מד הקילומטראז' לא ייאספו
+         עבורו — גם לא בעתיד.`
+      : `טרם נאספו קריאות של מד הקילומטראז'. הן יופיעו לאחר המבחן הבא של הרכב.`;
+    return `<div class="card"><div class="empty">${msg}</div></div>`;
   }
   const rows = odometer.map((p, i) => {
     const next = odometer[i + 1];   // предыдущий по времени тест
@@ -601,7 +612,16 @@ function renderChangeLog(changes) {
   </div>`;
 }
 
-function renderLocalHistory(local) {
+// ctx = { inRegistry, hasMileageSource } — берётся из ЖИВОГО поиска, который на
+// этой же странице уже отработал. Нужен, чтобы отличить "пробега по этой машине
+// не бывает" от "копим, зайдите позже".
+//
+// ПОЧЕМУ ЭТО ВАЖНО (найдено 06.09.2026, разбор в HANDOFF §6.8-бис): министерство
+// публикует километраж ТОЛЬКО для машин 2017 года и новее — это 59% реестра.
+// Для остальных 1.7 млн машин старый текст "היסטוריה טרם נצברה" обещал то, чего
+// не будет никогда: человек вернулся бы через месяц и увидел ровно то же самое.
+function renderLocalHistory(local, ctx) {
+  ctx = ctx || {};
   let html = `<div class="section-title">היסטוריה שנצברה (מאגר עצמאי)</div>`;
   if (local && local.rateLimited) {
     html += `<div class="card"><div class="empty">חריגה ממכסת הבקשות להיסטוריה מהכתובת שלכם —
@@ -614,8 +634,24 @@ function renderLocalHistory(local) {
     return html;
   }
   if (!local || local.available === false) {
-    html += `<div class="card"><div class="empty">היסטוריית הקילומטראז' של מספר זה טרם נצברה
-      (או שהמספר אינו מכוסה, או שעדיין לא היה צילום שבועי שני).</div></div>`;
+    let msg;
+    if (ctx.inRegistry === false) {
+      // Машины нет в основном реестре — говорить про накопление бессмысленно.
+      msg = `מספר הרכב אינו מופיע במרשם כלי הרכב של משרד התחבורה.`;
+    } else if (ctx.hasMileageSource === false) {
+      // Машина есть, но министерство не публикует по ней километраж вообще.
+      // Честно говорим, что ждать нечего, и не прячем причину.
+      msg = `משרד התחבורה אינו מפרסם קילומטראז' עבור רכב זה, ולכן היסטוריית
+        קילומטראז' לא תיצבר עבורו — גם לא בעתיד. נתוני הקילומטראז' מתפרסמים רק
+        לרכבים פרטיים משנת 2017 ואילך. שאר הפרטים שלמעלה — כולל היסטוריית
+        הבעלות, מועד המבחן האחרון ותוקף הרישיון — זמינים כרגיל.`;
+    } else {
+      // Пробег у источника есть, просто у нас ещё нет двух точек для сравнения.
+      msg = `היסטוריית הקילומטראז' של מספר זה עדיין לא נצברה אצלנו. המאסף מתעד
+        צילום שבועי, ונדרשים שני מבחני רישוי שונים כדי להציג מגמה או לזהות
+        גלגול מד אוץ. הנתונים יופיעו לאחר המבחן הבא של הרכב.`;
+    }
+    html += `<div class="card"><div class="empty">${msg}</div></div>`;
     return html;
   }
   if (local.engine_changes && local.engine_changes.length) {
@@ -635,7 +671,7 @@ function renderLocalHistory(local) {
       </div>`).join("")}
     </div>`;
   }
-  html += renderOdometerTable(local.odometer);
+  html += renderOdometerTable(local.odometer, ctx);
 
   html += renderChangeLog(local.changes);
   return html;
@@ -691,7 +727,12 @@ async function search() {
 
   html += renderMain(merged);
   if (merged) html += renderMileageAnalysis(merged);
-  html += renderLocalHistory(accumulatedHistory);
+  // Живой поиск уже сказал нам две вещи, которых накопленный блок сам не знает:
+  // есть ли машина в реестре и публикует ли министерство по ней километраж.
+  html += renderLocalHistory(accumulatedHistory, {
+    inRegistry: Boolean(mainRecord),
+    hasMileageSource: Boolean(historyRecord),
+  });
 
   html += `<div class="section-title">סטטוס ושימוש</div>`;
   html += renderScrapped(scrapHits);

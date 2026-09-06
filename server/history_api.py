@@ -97,9 +97,26 @@ def get_local_data(plate: str) -> dict:
             ).fetchall()
         ]
 
+        # Два флага, чтобы интерфейс отличал "пробега по этой машине НЕ БЫВАЕТ"
+        # от "копим, зайдите позже". Без них обе ситуации выглядели одинаково.
+        #
+        # ПОЧЕМУ (HANDOFF §6.8-бис, найдено 06.09.2026): министерство публикует
+        # километраж только для машин 2017 года и новее — 59% реестра. Для
+        # остальных 1.7 млн машин запись есть в current_state_main, но её нет
+        # в current_state, и пробега не появится никогда. Старый текст
+        # "היסטוריה טרם נצברה" обещал им то, чего не будет.
+        in_registry = conn.execute(
+            "SELECT 1 FROM current_state_main WHERE plate=? LIMIT 1",
+            (str(plate_int),)).fetchone() is not None
+        mileage_published = conn.execute(
+            "SELECT 1 FROM current_state WHERE plate=? LIMIT 1",
+            (str(plate_int),)).fetchone() is not None
+
         return {
             "available": True,
             "note": None,
+            "in_registry": in_registry,
+            "mileage_published": mileage_published,
             "odometer": odometer,
             "changes": changes,
             "engine_changes": engine_changes,
