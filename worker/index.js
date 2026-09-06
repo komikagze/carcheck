@@ -158,10 +158,23 @@ async function handleHistory(request, env, rawPlate) {
     // Все показания одометра по этой машине, от новых к старым:
     // первые две строки — это и есть "последний" и "предыдущий" тест.
     ["SELECT test_date, km FROM odometer WHERE plate = ? ORDER BY test_date DESC", [plate]],
-    // Полный журнал изменений по этой машине.
+    // Журнал изменений по этой машине.
+    //
+    // change_kind != 'new_car' отсекает записи "машина увидена впервые": у них
+    // пустые field/old_value/new_value, и в интерфейс они попадали строкой
+    // "הרכב נוסף למאגר" с прочерками — то есть занимали место, не сообщая
+    // ничего. В Turso их лежит 1.63 млн: они уехали туда до того, как заливка
+    // научилась их отбрасывать (см. sync_changes в export/turso_upload.py).
+    // Удалять их из Turso не стали — удаление тоже тратит месячную квоту, —
+    // поэтому отсекаем здесь, при чтении.
+    //
+    // Следствие, и оно намеренное: машина, у которой кроме этой записи ничего
+    // нет, теперь отдаёт "история не накоплена" вместо пустой строки журнала.
+    // Так честнее: истории по ней у нас действительно ещё нет.
     [
       "SELECT detected_at, change_kind, field, field_label, old_value, new_value " +
-        "FROM changes WHERE plate = ? ORDER BY detected_at ASC, local_id ASC",
+        "FROM changes WHERE plate = ? AND change_kind != 'new_car' " +
+        "ORDER BY detected_at ASC, local_id ASC",
       [plate],
     ],
   ];
