@@ -248,7 +248,12 @@ def sync_odometer(conn, api_url, token, state):
         # последнюю пачку (INSERT OR REPLACE это переживает), но не потеряем.
         set_sync_state(api_url, token, {"odometer_cursor": f"{c1}|{c2}|{c3}"})
         total += len(rows)
-        print(f"[turso_upload] odometer: залито {total} строк...")
+        # Курсор печатаем В СТРОКЕ прогресса намеренно: если прогон оборвут,
+        # точка возобновления видна прямо в логе, без похода в базу за
+        # sync_state. В августе 2026 именно незнание "где остановились"
+        # и было главной болью после прерванной заливки (HANDOFF §4.1).
+        print(f"[turso_upload] odometer: залито {total} строк, "
+              f"курсор -> {c1}|{c2}|{c3}", flush=True)
     return total
 
 
@@ -294,7 +299,8 @@ def sync_changes(conn, api_url, token, state):
         cursor = rows[-1][0]
         set_sync_state(api_url, token, {"changes_cursor": cursor})
         total += len(rows)
-        print(f"[turso_upload] changes: залито {total} строк...")
+        print(f"[turso_upload] changes: залито {total} строк, "
+              f"курсор -> id {cursor}", flush=True)
     return total
 
 
@@ -343,6 +349,30 @@ def run(db_path: str = None):
 
     conn = sqlite3.connect(db_path)
     try:
+        # ПРЕДПОЛЁТНЫЙ ПОДСЧЁТ. Печатаем план ДО первой записи, чтобы по логу
+        # было видно не только "залито N", но и "из скольких" — иначе при
+        # обрыве непонятно, прошли мы четверть или почти всё. Считается
+        # локально, квоту Turso не тратит.
+        raw = state.get("odometer_cursor") or "||"
+        c1, c2, c3 = (raw.split("|") + ["", "", ""])[:3]
+        todo_odo = conn.execute(
+            "SELECT COUNT(*) FROM odometer_readings "
+            "WHERE (first_seen_at, plate, test_date) > (?, ?, ?)", (c1, c2, c3)
+        ).fetchone()[0]
+        todo_ch = conn.execute(
+            "SELECT COUNT(*) FROM field_changes WHERE id > ? AND field IS NOT NULL",
+            (int(state.get("changes_cursor") or 0),)
+        ).fetchone()[0]
+        total_todo = todo_odo + todo_ch
+        blocks = -(-total_todo // BATCH_ROWS) if total_todo else 0
+        print(f"[turso_upload] План: {total_todo} строк "
+              f"(odometer {todo_odo}, changes {todo_ch}) = {blocks} блоков "
+              f"по {BATCH_ROWS}. Курсор пишется ПОСЛЕ каждого блока, "
+              f"поэтому обрыв не теряет прогресс.", flush=True)
+        print(f"[turso_upload] Оценка квоты Turso: ~{total_todo * 2} единиц "
+              f"из 10 000 000 в месяц (~2 единицы на строку: строка + индекс).",
+              flush=True)
+
         odo = sync_odometer(conn, api_url, token, state)
         changes = sync_changes(conn, api_url, token, state)
     finally:
@@ -352,8 +382,11 @@ def run(db_path: str = None):
     if uploaded == 0:
         print("[turso_upload] Новых данных с прошлой заливки нет — заливать нечего.")
     else:
-        print(f"[turso_upload] Готово: {uploaded} строк в Turso "
-              f"(odometer {odo}, changes {changes}).")
+        print(f"[turso_upload] Готово: {uploaded} строк из {total_todo} "
+              f"(odometer {odo}, changes {changes}).", flush=True)
+    # Итоговые курсоры — точка, с которой начнётся следующий прогон.
+    final = get_sync_state(api_url, token)
+    print(f"[turso_upload] Курсоры на конец прогона: {final}", flush=True)
     return {"ok": True, "uploaded": uploaded}
 
 

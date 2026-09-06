@@ -114,11 +114,18 @@ jobs:
             --pattern carcheck.sqlite3 --dir collector/db --clobber \
             || echo "Релиза db-latest ещё нет — это первый прогон, БД создастся с нуля."
 
+      # ВЕЗДЕ python -u. Без него Python буферизует stdout, и строки, записанные
+      # перед аварийным завершением, до лога не доезжают. На этом уже обожглись
+      # 14.08.2026: прогон отменили, последняя строка лога была 08:34, а
+      # завершился он в 08:40 — шесть минут работы и ~218 тыс. записанных строк
+      # оказались невидимы, и понять, где именно остановились, было нельзя
+      # (HANDOFF §4.1). Флаг стоит копейки, а без него лог врёт ровно в тот
+      # момент, когда он нужнее всего.
       - name: Run collector (package_show -> постраничная загрузка через JSON API -> диф -> SQLite)
-        run: python collector/collector.py
+        run: python -u collector/collector.py
 
       - name: Run export (собрать статический сайт в export/dist, без данных по машинам)
-        run: python export/export.py
+        run: python -u export/export.py
 
       - name: Upload updated database to GitHub Release (db-latest)
         env:
@@ -180,7 +187,7 @@ jobs:
             echo "[turso] Сбор данных при этом отработал штатно, история копится в базе."
             exit 0
           fi
-          python export/turso_upload.py
+          python -u export/turso_upload.py
         # Если секреты ещё не заведены — скрипт сам это обнаружит, аккуратно
         # пропустит загрузку и объяснит, что нужно настроить (см. README), а не
         # уронит весь workflow с невнятной ошибкой.
